@@ -8,7 +8,7 @@ py -3.11 -m venv .build-venv
 & .\.build-venv\Scripts\python.exe -m pip install -r requirements.txt
 
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
-& .\.build-venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name "水印清除助手" --add-data "static;static" --collect-all remove_ai_watermarks launcher.py
+& .\.build-venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name "WatermarkHelper" --add-data "static;static" --collect-all remove_ai_watermarks launcher.py
 
 $isccCandidates = @(
   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
