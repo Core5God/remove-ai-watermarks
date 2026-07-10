@@ -17,4 +17,4 @@ $isccCandidates = @(
 )
 $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not (Test-Path $iscc)) { throw "找不到 Inno Setup 编译器 ISCC.exe" }
-& $iscc installer\水印清除助手.iss
+& $iscc installer\setup.iss
