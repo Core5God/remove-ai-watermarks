@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -12,12 +13,15 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from remove_ai_watermarks.metadata import (
+    C2PA_UUID,
     _is_ai_key,
+    c2pa_marker_in,
     exif_generator,
     get_ai_metadata,
     has_ai_metadata,
     iptc_ai_system,
     remove_ai_metadata,
+    samsung_genai,
     synthid_source,
     xai_signature,
 )
@@ -122,6 +126,24 @@ class TestHasAiMetadata:
 
         assert not has_ai_metadata(out)
 
+    def test_remove_ai_metadata_blanks_exif_token_item_in_avif(self, tmp_path: Path):
+        """End-to-end: ``remove_ai_metadata`` blanks an AI-generator EXIF token
+        stored as a meta-box Exif item (bytes in mdat) without re-encoding."""
+        from remove_ai_watermarks.metadata import remove_ai_metadata
+
+        ftyp = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1"
+        blob = piexif.dump({"0th": {piexif.ImageIFD.Software: b"Midjourney", piexif.ImageIFD.Make: b"NIKON"}})
+        mdat = struct.pack(">I", 8 + len(blob)) + b"mdat" + blob
+        src = tmp_path / "in.avif"
+        src.write_bytes(ftyp + mdat)
+
+        out = tmp_path / "out.avif"
+        remove_ai_metadata(src, out)
+        cleaned = out.read_bytes()
+        assert len(cleaned) == len(ftyp + mdat)  # in place, no re-encode
+        assert b"Midjourney" not in cleaned  # AI token gone
+        assert b"NIKON" in cleaned  # camera tag preserved
+
     def test_detects_iptc_trained_algorithmic_media_marker(self, tmp_path: Path):
         """Some pipelines embed only the IPTC AI marker in XMP, no C2PA manifest."""
         path = tmp_path / "fake.jpg"
@@ -133,6 +155,71 @@ class TestHasAiMetadata:
         )
         path.write_bytes(b"\xff\xd8\xff\xe1" + xmp + b"\xff\xd9")
         assert has_ai_metadata(path)
+
+
+class TestC2paMarkerIn:
+    """The C2PA presence check requires a JUMBF wrapper or the C2PA uuid box, so
+    a bare 4-byte ``c2pa`` substring (e.g. random compressed pixel data) does not
+    false-positive -- the regression behind 4 cleaned PNGs re-flagging C2PA."""
+
+    def test_jumbf_wrapped_c2pa_detected(self):
+        assert c2pa_marker_in(b"....jumbc2pa....manifest....") is True
+
+    def test_c2pa_uuid_box_detected(self):
+        assert c2pa_marker_in(b"\x00\x00\x00\x18uuid" + C2PA_UUID + b"payload") is True
+
+    def test_bare_c2pa_substring_not_detected(self):
+        # The exact false positive: "c2pa" appears in noise but no JUMBF/uuid box.
+        assert c2pa_marker_in(b"\x9c\xc3\xa7B1\x11c2pa\x80b\x804\xc5\xf9random idat") is False
+
+    def test_jumb_without_c2pa_not_detected(self):
+        assert c2pa_marker_in(b"some jumb box but no manifest label") is False
+
+    def test_empty_not_detected(self):
+        assert c2pa_marker_in(b"") is False
+
+
+class TestSamsungGenai:
+    """Samsung Galaxy AI editing marker (genAIType in PhotoEditor_Re_Edit_Data).
+
+    Synthetic byte blobs -- real Galaxy files are user content and not shipped
+    (public repo), same discipline as the Grok/Doubao fixtures.
+    """
+
+    @staticmethod
+    def _samsung_jpeg(tmp_path: Path, name: str, payload: bytes) -> Path:
+        path = tmp_path / name
+        path.write_bytes(b"\xff\xd8\xff\xe1" + payload + b"\xff\xd9")
+        return path
+
+    def test_nonzero_genai_type_detected(self, tmp_path: Path):
+        p = self._samsung_jpeg(
+            tmp_path, "galaxy.jpg", b'PhotoEditor_Re_Edit_Data{"connectorType":"srvg","genAIType":1}'
+        )
+        assert samsung_genai(p) == 1
+
+    def test_other_nonzero_value_detected(self, tmp_path: Path):
+        p = self._samsung_jpeg(tmp_path, "galaxy5.jpg", b'PhotoEditor_Re_Edit_Data{"genAIType":5}')
+        assert samsung_genai(p) == 5
+
+    def test_zero_genai_type_is_none(self, tmp_path: Path):
+        """genAIType:0 means no generative AI was used -- not a positive signal."""
+        p = self._samsung_jpeg(tmp_path, "edit.jpg", b'PhotoEditor_Re_Edit_Data{"genAIType":0}')
+        assert samsung_genai(p) is None
+
+    def test_genai_without_editor_container_ignored(self, tmp_path: Path):
+        """An incidental genAIType token outside Samsung's editor JSON is ignored."""
+        p = self._samsung_jpeg(tmp_path, "stray.jpg", b'some other blob "genAIType":1 elsewhere')
+        assert samsung_genai(p) is None
+
+    def test_clean_image_is_none(self, tmp_clean_png):
+        assert samsung_genai(tmp_clean_png) is None
+
+    def test_surfaced_in_get_ai_metadata(self, tmp_path: Path):
+        p = self._samsung_jpeg(tmp_path, "galaxy.jpg", b'PhotoEditor_Re_Edit_Data{"genAIType":1}')
+        meta = get_ai_metadata(p)
+        assert "samsung_genai" in meta
+        assert "genAIType=1" in meta["samsung_genai"]
 
 
 class TestGetAiMetadata:
@@ -322,6 +409,44 @@ class TestRemoveAiMetadata:
         assert result == jpg_path
         assert jpg_path.exists()
 
+    def test_jpeg_output_is_high_quality(self, tmp_path):
+        """JPEG output uses high quality + 4:4:4 (no chroma subsampling), not the
+        lossy PIL defaults (quality 75, 4:2:0) that visibly degrade the image."""
+        from PIL.JpegImagePlugin import get_sampling
+
+        img = Image.new("RGB", (64, 64), color=(100, 150, 200))
+        png_path = tmp_path / "source.png"
+        img.save(png_path)
+
+        jpg_path = tmp_path / "output.jpg"
+        remove_ai_metadata(png_path, jpg_path)
+
+        with Image.open(jpg_path) as out:
+            assert get_sampling(out) == 0  # 4:4:4, no chroma subsampling
+            # quality 95 quantization tables stay well below the q75 defaults
+            # (whose max quant value is ~40+); q95 tops out around 12.
+            assert max(max(t) for t in out.quantization.values()) <= 15
+
+    def test_webp_output_preserves_format_losslessly(self, tmp_path):
+        """A .webp output keeps the WebP format (not silently rewritten to PNG)
+        and is pixel-identical to the source (lossless)."""
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        arr = rng.integers(0, 255, (48, 48, 3), dtype=np.uint8)
+        src = Image.fromarray(arr, "RGB")
+        pnginfo = PngInfo()
+        pnginfo.add_text("parameters", "ai stuff")
+        png_path = tmp_path / "source.png"
+        src.save(png_path, pnginfo=pnginfo)
+
+        webp_path = tmp_path / "output.webp"
+        remove_ai_metadata(png_path, webp_path)
+
+        with Image.open(webp_path) as out:
+            assert out.format == "WEBP"
+            assert np.array_equal(np.asarray(out.convert("RGB")), arr)
+
     def test_creates_parent_directories(self, tmp_path):
         img = Image.new("RGB", (32, 32))
         pnginfo = PngInfo()
@@ -338,6 +463,31 @@ class TestRemoveAiMetadata:
         result = remove_ai_metadata(tmp_clean_png, output)
         assert isinstance(result, Path)
         assert result == output
+
+    def _sd_png(self, tmp_path: Path) -> Path:
+        img = Image.new("RGB", (32, 32), color=(80, 80, 80))
+        pnginfo = PngInfo()
+        pnginfo.add_text("parameters", "Steps: 20, Sampler: Euler")
+        img.save(tmp_path / "sd.png", pnginfo=pnginfo)
+        return tmp_path / "sd.png"
+
+    def test_png_to_jpeg_strips_ai(self, tmp_path):
+        # Cross-format output: the AI text chunk must not survive the PNG->JPEG
+        # re-encode, by detection AND by raw bytes.
+        out = tmp_path / "clean.jpg"
+        remove_ai_metadata(self._sd_png(tmp_path), out)
+        assert not has_ai_metadata(out)
+        body = out.read_bytes()
+        assert b"parameters" not in body
+        assert b"Steps" not in body
+
+    def test_png_to_webp_strips_ai(self, tmp_path):
+        out = tmp_path / "clean.webp"
+        remove_ai_metadata(self._sd_png(tmp_path), out)
+        assert not has_ai_metadata(out)
+        body = out.read_bytes()
+        assert b"parameters" not in body
+        assert b"Steps" not in body
 
 
 def _img_with_software(tmp_path: Path, fmt: str, software: str) -> Path:
@@ -387,6 +537,56 @@ class TestExifGenerator:
         path = tmp_path / "artist.jpg"
         Image.new("RGB", (64, 64)).save(path, exif=exif)
         assert exif_generator(path) == "Midjourney"
+
+    def test_novelai_png_text_chunk_detected(self, tmp_path: Path):
+        # NovelAI (mined corpus) stamps its generator in PNG tEXt Software/Source/
+        # Title chunks, not EXIF -- the PNG-text path must catch it.
+        from PIL.PngImagePlugin import PngInfo
+
+        info = PngInfo()
+        info.add_text("Software", "NovelAI")
+        info.add_text("Source", "NovelAI Diffusion V4.5 C02D4F98")
+        info.add_text("Title", "NovelAI generated image")
+        path = tmp_path / "novelai.png"
+        Image.new("RGB", (64, 64)).save(path, pnginfo=info)
+        assert exif_generator(path) == "NovelAI"
+
+    def test_reve_software_detected(self, tmp_path: Path):
+        # Reve Image (mined corpus) writes EXIF Software="reve.com".
+        path = _img_with_software(tmp_path, "jpg", "reve.com")
+        assert exif_generator(path) == "reve.com"
+
+    def test_reve_token_not_overmatched(self, tmp_path: Path):
+        # The "reve.com" token must not fire on incidental words like "forever".
+        path = _img_with_software(tmp_path, "jpg", "Forever Editor 2.0")
+        assert exif_generator(path) is None
+
+    def test_aphrodite_make_detected(self, tmp_path: Path):
+        # Aphrodite AI (mined corpus) writes EXIF Make="Aphrodite AI".
+        exif = piexif.dump({"0th": {piexif.ImageIFD.Make: b"Aphrodite AI"}, "Exif": {}, "GPS": {}, "1st": {}})
+        path = tmp_path / "aphrodite.jpg"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        assert exif_generator(path) == "Aphrodite AI"
+
+    def test_novelai_removal_parity(self, tmp_path: Path):
+        # Detection and removal must stay in parity: NovelAI stamps Title/Source
+        # under non-AI keys (AI-shaped VALUE), so removal must drop them by value,
+        # not only by key -- else the cleaned file still reads as NovelAI.
+        from PIL.PngImagePlugin import PngInfo
+
+        from remove_ai_watermarks.metadata import remove_ai_metadata
+
+        info = PngInfo()
+        info.add_text("Software", "NovelAI")
+        info.add_text("Source", "NovelAI Diffusion V4.5 C02D4F98")
+        info.add_text("Title", "NovelAI generated image")
+        src = tmp_path / "novelai.png"
+        Image.new("RGB", (64, 64)).save(src, pnginfo=info)
+        assert exif_generator(src) == "NovelAI"
+
+        out = tmp_path / "clean.png"
+        remove_ai_metadata(src, out)
+        assert exif_generator(out) is None
 
     def test_imagedescription_tag_ai_tool_detected(self, tmp_path: Path):
         # ...and the EXIF ImageDescription field.
@@ -511,6 +711,41 @@ class TestRemoveAiExif:
         kept = piexif.load(Image.open(out).info["exif"])["0th"]
         assert kept.get(piexif.ImageIFD.Make) == b"Apple"
 
+    def test_xai_pair_stripped_but_genuine_camera_tags_kept(self, tmp_path: Path):
+        # An image carrying BOTH the xAI Signature pair (ImageDescription =
+        # "Signature: <base64>" + UUID Artist) AND genuine non-AI camera tags.
+        # The scrub must delete only the xAI pair, leaving the camera tags intact.
+        sig = "Signature: " + "A" * 120
+        artist = "12345678-1234-1234-1234-123456789abc"
+        exif = piexif.dump(
+            {
+                "0th": {
+                    piexif.ImageIFD.ImageDescription: sig.encode(),
+                    piexif.ImageIFD.Artist: artist.encode(),
+                    piexif.ImageIFD.Make: b"Canon",
+                    piexif.ImageIFD.Model: b"EOS R5",
+                },
+                "Exif": {piexif.ExifIFD.DateTimeOriginal: b"2024:01:01 12:00:00"},
+                "GPS": {piexif.GPSIFD.GPSLatitudeRef: b"N"},
+                "1st": {},
+            }
+        )
+        src = tmp_path / "grok_plus_cam.jpg"
+        Image.new("RGB", (32, 32)).save(src, exif=exif)
+        out = tmp_path / "scrubbed.jpg"
+        remove_ai_metadata(src, out)
+
+        # xAI signature pair is gone (xai_signature returns a bool, not None).
+        assert xai_signature(out) is False
+        kept = piexif.load(Image.open(out).info["exif"])
+        assert kept["0th"].get(piexif.ImageIFD.ImageDescription) is None
+        assert kept["0th"].get(piexif.ImageIFD.Artist) is None
+        # Genuine camera tags are preserved.
+        assert kept["0th"].get(piexif.ImageIFD.Make) == b"Canon"
+        assert kept["0th"].get(piexif.ImageIFD.Model) == b"EOS R5"
+        assert kept["Exif"].get(piexif.ExifIFD.DateTimeOriginal) == b"2024:01:01 12:00:00"
+        assert kept["GPS"].get(piexif.GPSIFD.GPSLatitudeRef) == b"N"
+
 
 class TestAIGCLabel:
     """China TC260 AIGC labeling (Doubao and other China-served generators)."""
@@ -553,6 +788,200 @@ class TestAIGCLabel:
         meta = get_ai_metadata(self._aigc_png(tmp_path))
         assert "aigc_label" in meta
         assert "TC260" in meta["aigc_label"]
+
+    def _aigc_chunk_png(self, tmp_path: Path, producer: str = "doubao") -> Path:
+        """Doubao writes the TC260 object as a PNG ``tEXt`` chunk keyed ``AIGC``
+        with raw JSON (no XMP, no namespaced marker)."""
+        import json
+
+        p = tmp_path / "doubao_chunk.png"
+        pnginfo = PngInfo()
+        pnginfo.add_text(
+            "AIGC",
+            json.dumps({"Label": "1", "ContentProducer": producer, "ProduceID": "abc123"}),
+        )
+        Image.new("RGB", (32, 32)).save(p, pnginfo=pnginfo)
+        return p
+
+    def test_parses_png_text_chunk_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_chunk_png(tmp_path))
+        assert info is not None
+        assert info["Label"] == "1"
+        assert info["ContentProducer"] == "doubao"
+
+    def test_png_chunk_without_tc260_field_ignored(self, tmp_path: Path):
+        """A generic ``AIGC`` chunk with no TC260 field must not false-positive."""
+        import json
+
+        from remove_ai_watermarks.metadata import aigc_label
+
+        p = tmp_path / "unrelated.png"
+        pnginfo = PngInfo()
+        pnginfo.add_text("AIGC", json.dumps({"unrelated": "value"}))
+        Image.new("RGB", (32, 32)).save(p, pnginfo=pnginfo)
+        assert aigc_label(p) is None
+
+    def test_has_ai_metadata_detects_png_chunk_form(self, tmp_path: Path):
+        assert has_ai_metadata(self._aigc_chunk_png(tmp_path))
+
+    def test_remove_strips_png_chunk_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label, remove_ai_metadata
+
+        out = tmp_path / "clean.png"
+        remove_ai_metadata(self._aigc_chunk_png(tmp_path), out)
+        assert aigc_label(out) is None
+        assert not has_ai_metadata(out)
+
+    def _aigc_exif_jpeg(self, tmp_path: Path, producer: str = "001191440300708461136T1308L") -> Path:
+        """Some China-served generators embed the raw-JSON ``{"AIGC":{...}}``
+        block in JPEG EXIF (UserComment) -- no PNG chunk, no namespaced XMP."""
+        import json
+
+        import piexif
+
+        p = tmp_path / "aigc_exif.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        payload = json.dumps({"AIGC": {"Label": "1", "ContentProducer": producer, "ProduceID": "abc123"}})
+        exif = {"Exif": {piexif.ExifIFD.UserComment: payload.encode("ascii")}}
+        piexif.insert(piexif.dump(exif), str(p))
+        return p
+
+    def test_parses_raw_json_exif_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_exif_jpeg(tmp_path))
+        assert info is not None
+        assert info["Label"] == "1"
+        assert info["ContentProducer"] == "001191440300708461136T1308L"
+
+    def test_has_ai_metadata_detects_raw_json_exif_form(self, tmp_path: Path):
+        assert has_ai_metadata(self._aigc_exif_jpeg(tmp_path))
+
+    def _aigc_bare_jpeg(self, tmp_path: Path, producer: str = "00119144030008867405X210002") -> Path:
+        """Some China-served generators glue the TC260 label straight to its JSON
+        as a bare ``AIGC{...}`` blob inside a JPEG APP segment (no ``"AIGC":``
+        key wrapper, no PNG chunk, no namespaced XMP) -- seen near the JFIF
+        header on real 2026-06 downloads."""
+        p = tmp_path / "aigc_bare.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        raw = p.read_bytes()
+        blob = b'AIGC{"Label":"1","ContentProducer":"' + producer.encode() + b'","ProduceID":"8F995586"}'
+        segment = b"\xff\xe9" + (len(blob) + 2).to_bytes(2, "big") + blob  # APP9
+        p.write_bytes(raw[:2] + segment + raw[2:])  # splice after SOI
+        return p
+
+    def test_parses_bare_aigc_jpeg_segment_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_bare_jpeg(tmp_path))
+        assert info is not None
+        assert info["Label"] == "1"
+        assert info["ContentProducer"] == "00119144030008867405X210002"
+
+    def test_has_ai_metadata_detects_bare_aigc_jpeg_form(self, tmp_path: Path):
+        assert has_ai_metadata(self._aigc_bare_jpeg(tmp_path))
+
+    def test_bare_aigc_without_tc260_field_ignored(self, tmp_path: Path):
+        """A bare ``AIGC{...}`` blob with no TC260 field must not false-positive."""
+        from remove_ai_watermarks.metadata import aigc_label
+
+        p = tmp_path / "bare_unrelated.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        raw = p.read_bytes()
+        blob = b'AIGC{"unrelated":"value"}'
+        segment = b"\xff\xe9" + (len(blob) + 2).to_bytes(2, "big") + blob
+        p.write_bytes(raw[:2] + segment + raw[2:])
+        assert aigc_label(p) is None
+
+    def test_raw_json_without_tc260_field_ignored(self, tmp_path: Path):
+        """A bare ``{"AIGC":{...}}`` object with no TC260 field must not fire."""
+        import json
+
+        import piexif
+
+        from remove_ai_watermarks.metadata import aigc_label
+
+        p = tmp_path / "unrelated.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        payload = json.dumps({"AIGC": {"unrelated": "value"}})
+        exif = {"Exif": {piexif.ExifIFD.UserComment: payload.encode("ascii")}}
+        piexif.insert(piexif.dump(exif), str(p))
+        assert aigc_label(p) is None
+
+    def _aigc_attr_png(self, tmp_path: Path, producer: str = "picwish") -> Path:
+        """PicWish writes the TC260 label as an XMP *attribute*
+        (``TC260:AIGC="{...}"``), not the nested element form."""
+        p = tmp_path / "picwish.png"
+        Image.new("RGB", (32, 32)).save(p)
+        xmp = (
+            '<rdf:Description rdf:about="" '
+            'xmlns:TC260="http://www.tc260.org.cn/ns/AIGC/1.0/" '
+            f'TC260:AIGC="{{&quot;Label&quot;:&quot;1&quot;,&quot;ContentProducer&quot;:&quot;{producer}&quot;}}"/>'
+        )
+        with open(p, "ab") as f:
+            f.write(xmp.encode())
+        return p
+
+    def test_parses_xmp_attribute_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_attr_png(tmp_path))
+        assert info is not None
+        assert info["ContentProducer"] == "picwish"
+
+    def test_scan_head_collects_png_metadata_past_window(self, tmp_path: Path):
+        """A PNG metadata chunk beyond the read window is still reachable -- the
+        regression for a TC260 XMP packet appended after a large IDAT."""
+        import json
+
+        from remove_ai_watermarks.metadata import _png_late_metadata, scan_head
+
+        p = tmp_path / "late.png"
+        pnginfo = PngInfo()
+        pnginfo.add_text("AIGC", json.dumps({"Label": "1", "ContentProducer": "doubao"}))
+        Image.new("RGB", (16, 16)).save(p, pnginfo=pnginfo)
+        # window = 8 (just the signature) makes the text chunk "late".
+        assert b"ContentProducer" in _png_late_metadata(p, 8)
+        assert b"ContentProducer" in scan_head(p, 8)
+
+
+class TestHuggingFaceJob:
+    """HuggingFace-hosted job marker (``hf-job-id`` PNG text chunk)."""
+
+    def _hf_png(self, tmp_path: Path, job_id: str = "ec8380a6-2091-423a-b835-209420f99ee1") -> Path:
+        p = tmp_path / "hfjob.png"
+        pnginfo = PngInfo()
+        pnginfo.add_text("hf-job-id", job_id)
+        Image.new("RGB", (32, 32)).save(p, pnginfo=pnginfo)
+        return p
+
+    def test_returns_job_id(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import huggingface_job
+
+        assert huggingface_job(self._hf_png(tmp_path)) == "ec8380a6-2091-423a-b835-209420f99ee1"
+
+    def test_none_when_absent(self, tmp_clean_png):
+        from remove_ai_watermarks.metadata import huggingface_job
+
+        assert huggingface_job(tmp_clean_png) is None
+
+    def test_has_ai_metadata_detects_hf_job(self, tmp_path: Path):
+        assert has_ai_metadata(self._hf_png(tmp_path))
+
+    def test_get_ai_metadata_surfaces_hf_job(self, tmp_path: Path):
+        meta = get_ai_metadata(self._hf_png(tmp_path))
+        assert "huggingface_job" in meta
+        assert "ec8380a6" in meta["huggingface_job"]
+
+    def test_remove_strips_hf_job(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import huggingface_job, remove_ai_metadata
+
+        out = tmp_path / "clean.png"
+        remove_ai_metadata(self._hf_png(tmp_path), out)
+        assert huggingface_job(out) is None
+        assert not has_ai_metadata(out)
 
 
 @pytest.mark.skipif(not (SAMPLES_DIR / "doubao-1.png").exists(), reason="doubao sample not present")
@@ -631,6 +1060,11 @@ _MP4_FTYP = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
 _MP4_MDAT = b"\x00\x00\x00\x10mdat" + b"videodat"
 
 
+def _box(box_type: bytes, payload: bytes) -> bytes:
+    """Build a 32-bit-size ISOBMFF box: [size:4][type:4][payload]."""
+    return (8 + len(payload)).to_bytes(4, "big") + box_type + payload
+
+
 class TestVideoC2pa:
     """C2PA in MP4 (ISOBMFF) -- detect + strip, reusing the image box walker."""
 
@@ -651,6 +1085,121 @@ class TestVideoC2pa:
         out = tmp_path / "out.mp4"
         remove_ai_metadata(src, out)
         assert out.read_bytes() == _MP4_FTYP + _MP4_MDAT
+        assert has_ai_metadata(out) is False
+
+
+class TestLateProvenanceBox:
+    """A C2PA / provenance box placed AFTER a large mdat (streaming / non-faststart
+    MP4) must still be detected -- the fixed first-MB scan would miss it."""
+
+    def _mp4_late_c2pa(self, tmp_path: Path, gap: int = 1_500_000) -> Path:
+        from remove_ai_watermarks.metadata import C2PA_UUID
+
+        big_mdat = _box(b"mdat", b"\x00" * gap)  # > 1 MB pushes the manifest past the scan window
+        manifest = C2PA_UUID + b"OpenAI jumbf c2pa ... trainedAlgorithmicMedia ..."
+        p = tmp_path / "stream.mp4"
+        p.write_bytes(_MP4_FTYP + big_mdat + _box(b"uuid", manifest))
+        return p
+
+    def test_scan_c2pa_region_finds_late_box(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import C2PA_UUID
+        from remove_ai_watermarks.noai.isobmff import scan_c2pa_region
+
+        region = scan_c2pa_region(self._mp4_late_c2pa(tmp_path))
+        assert C2PA_UUID in region
+        assert b"trainedAlgorithmicMedia" in region
+
+    def test_fixed_window_would_have_missed_it(self, tmp_path: Path):
+        # Documents the regression the box walk fixes: the manifest is beyond 1 MB.
+        from remove_ai_watermarks.metadata import C2PA_UUID
+
+        p = self._mp4_late_c2pa(tmp_path)
+        assert C2PA_UUID not in p.read_bytes()[: 1024 * 1024]
+
+    def test_scan_head_includes_late_box(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import C2PA_UUID, scan_head
+
+        assert C2PA_UUID in scan_head(self._mp4_late_c2pa(tmp_path))
+
+    def test_has_ai_metadata_detects_late_manifest(self, tmp_path: Path):
+        assert has_ai_metadata(self._mp4_late_c2pa(tmp_path)) is True
+
+    def test_scan_c2pa_region_non_isobmff_is_empty(self, tmp_path: Path):
+        from remove_ai_watermarks.noai.isobmff import scan_c2pa_region
+
+        p = tmp_path / "not.bin"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n not an isobmff file")
+        assert scan_c2pa_region(p) == b""
+
+    def test_front_placed_manifest_still_detected(self, tmp_path: Path):
+        # Regression: a faststart MP4 (manifest before mdat) is unaffected.
+        from remove_ai_watermarks.metadata import C2PA_UUID
+
+        manifest = C2PA_UUID + b"OpenAI ... trainedAlgorithmicMedia ..."
+        p = tmp_path / "front.mp4"
+        p.write_bytes(_MP4_FTYP + _box(b"uuid", manifest) + _box(b"mdat", b"\x00" * 100))
+        assert has_ai_metadata(p) is True
+
+
+_AI_XMP = (
+    b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    b'<x:xmpmeta><TC260:AIGC>{"Label":"1"}</TC260:AIGC></x:xmpmeta>'
+    b'<?xpacket end="w"?>'
+)
+_PLAIN_XMP = (
+    b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    b"<x:xmpmeta><dc:rights>(c) me</dc:rights></x:xmpmeta>"
+    b'<?xpacket end="w"?>'
+)
+
+
+class TestMetaBoxXmpBlanking:
+    """HEIF/AVIF store XMP as a meta-box ``mime`` item (bytes in mdat/idat), out of
+    reach of the top-level box stripper. An AI-label XMP packet there is blanked
+    in place (same length -> iloc offsets and image data stay intact)."""
+
+    def test_blanks_ai_packet_only(self):
+        from remove_ai_watermarks.noai.isobmff import blank_ai_xmp_packets
+
+        before, after = b"IMG_BEFORE" * 4, b"IMG_AFTER" * 4
+        data = before + _AI_XMP + after + _PLAIN_XMP
+        out, n = blank_ai_xmp_packets(data)
+        assert n == 1
+        assert len(out) == len(data)  # same length -> no offset shifts
+        assert b"TC260:AIGC" not in out  # AI label destroyed
+        assert before in out  # surrounding (image) bytes intact
+        assert after in out
+        assert b"dc:rights" in out  # plain XMP left alone
+
+    def test_no_packet_is_noop(self):
+        from remove_ai_watermarks.noai.isobmff import blank_ai_xmp_packets
+
+        data = b"just some mdat bytes, no xmp here"
+        assert blank_ai_xmp_packets(data) == (data, 0)
+
+    def test_plain_xmp_untouched(self):
+        from remove_ai_watermarks.noai.isobmff import blank_ai_xmp_packets
+
+        out, n = blank_ai_xmp_packets(_PLAIN_XMP)
+        assert n == 0
+        assert out == _PLAIN_XMP
+
+    def test_remove_ai_metadata_blanks_meta_box_xmp(self, tmp_path: Path):
+        # End-to-end: a HEIF with an AI XMP packet inside mdat is cleaned without
+        # touching the surrounding (coded image) bytes or the file length.
+        heic_ftyp = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"
+        img = b"CODEDIMAGE" * 8
+        mdat = _box(b"mdat", img + _AI_XMP + img)
+        src = tmp_path / "ai.heic"
+        src.write_bytes(heic_ftyp + mdat)
+        assert has_ai_metadata(src) is True
+
+        out = tmp_path / "clean.heic"
+        remove_ai_metadata(src, out)
+        res = out.read_bytes()
+        assert len(res) == src.stat().st_size  # length preserved
+        assert b"TC260:AIGC" not in res
+        assert img in res  # coded image bytes intact
         assert has_ai_metadata(out) is False
 
 
@@ -718,9 +1267,17 @@ class TestFfmpegMetadataStrip:
     def _wav_with_tag(self, path: Path, tag: str = "Suno AI") -> None:
         subprocess.run(  # noqa: S603
             [
-                shutil.which("ffmpeg"), "-y", "-loglevel", "error",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-                "-metadata", f"title={tag}", str(path),
+                shutil.which("ffmpeg"),
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.1",
+                "-metadata",
+                f"title={tag}",
+                str(path),
             ],
             check=True,
         )
@@ -733,3 +1290,49 @@ class TestFfmpegMetadataStrip:
         remove_ai_metadata(src, out)
         assert out.exists()
         assert b"Suno AI generated" not in out.read_bytes()  # tag stripped, audio kept
+
+
+class TestC2paCloudManifest:
+    """C2PA 2.4 Durable Content Credentials: an XMP dcterms:provenance pointer to
+    a vendor cloud manifest store survives when the embedded manifest is stripped."""
+
+    def _cloud_png(self, tmp_path: Path, host: bytes = b"cai-manifests.adobe.com") -> Path:
+        xmp = (
+            b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about="" xmlns:dcterms="http://purl.org/dc/terms/" '
+            b'dcterms:provenance="https://' + host + b'/manifests/urn-c2pa-abc123"> </rdf:Description>'
+            b'</rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+        )
+        p = tmp_path / "cloud.png"
+        img = Image.new("RGB", (16, 16))
+        meta = PngInfo()
+        meta.add_itxt("XML:com.adobe.xmp", xmp.decode("latin-1"))
+        img.save(p, pnginfo=meta)
+        return p
+
+    def test_detects_adobe_cloud_manifest(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        assert c2pa_cloud_manifest(self._cloud_png(tmp_path)) == "Adobe Content Authenticity"
+
+    def test_no_provenance_pointer_is_none(self, tmp_clean_png: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        assert c2pa_cloud_manifest(tmp_clean_png) is None
+
+    def test_unknown_host_is_none(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        # A dcterms:provenance pointer to an unrecognized host is not attributed.
+        assert c2pa_cloud_manifest(self._cloud_png(tmp_path, host=b"manifests.example.com")) is None
+
+    def test_cloud_manifest_does_not_assert_ai(self, tmp_path: Path):
+        # Provenance only -- a cloud manifest can describe a human edit, so the
+        # verdict must stay 'unknown', not 'AI-generated'.
+        from remove_ai_watermarks.identify import identify
+
+        r = identify(self._cloud_png(tmp_path), check_visible=False, check_invisible=False)
+        assert r.is_ai_generated is None
+        assert any("Durable Content Credentials" in w for w in r.watermarks)
+        assert any(s.name == "c2pa_cloud" for s in r.signals)

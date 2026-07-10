@@ -29,8 +29,14 @@ def run_img2img(
     generator: Any,
     device: str,
     set_progress: Callable[[str], None],
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Image.Image:
-    """Execute img2img with live progress and return the generated image."""
+    """Execute img2img with live progress and return the generated image.
+
+    ``extra_kwargs`` overlays additional pipeline arguments (e.g. the ControlNet
+    ``control_image`` / ``controlnet_conditioning_scale`` and a non-empty prompt),
+    so a ControlNet img2img pass reuses the same progress + fallback machinery.
+    """
     effective_steps = max(1, int(num_inference_steps * strength))
 
     step_cb, first_step, done_ev, start_updater = make_pipeline_progress(
@@ -42,26 +48,23 @@ def run_img2img(
 
     try:
         result = _call_pipeline(
-            pipeline,
-            image,
-            strength,
-            num_inference_steps,
-            guidance_scale,
-            generator,
-            step_cb,
+            pipeline, image, strength, num_inference_steps, guidance_scale, generator, step_cb, extra_kwargs
         )
         done_ev.set()
         return result.images[0]
-    except TypeError:
+    except TypeError as exc:
+        # The only TypeError we retry is the deprecated-callback case: `_call_pipeline`
+        # passes the legacy `callback`/`callback_steps` kwargs, and a diffusers version
+        # that removed them raises TypeError("... unexpected keyword argument
+        # 'callback'"). We then re-run once WITHOUT the progress callback. Any OTHER
+        # TypeError (e.g. a bad control_image/dtype in the forward pass) is a real error
+        # -- re-raise it instead of silently re-running the whole diffusion pass and
+        # masking the cause.
+        if "callback" not in str(exc):
+            raise
         first_step.set()
         result = _call_pipeline(
-            pipeline,
-            image,
-            strength,
-            num_inference_steps,
-            guidance_scale,
-            generator,
-            None,
+            pipeline, image, strength, num_inference_steps, guidance_scale, generator, None, extra_kwargs
         )
         done_ev.set()
         return result.images[0]
@@ -81,11 +84,13 @@ def run_img2img_with_mps_fallback(
     set_progress: Callable[[str], None],
     *,
     reload_on_cpu: Callable[[], Any],
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> tuple[Image.Image, str]:
     """Run img2img; on MPS error, fall back to CPU.
 
-    Returns:
-        (result_image, final_device) — device may change to ``"cpu"`` on fallback.
+    ``extra_kwargs`` overlays extra pipeline arguments (used by the ControlNet
+    path). Returns ``(result_image, final_device)`` — device may change to
+    ``"cpu"`` on fallback.
     """
     pipeline = load_pipeline()
 
@@ -99,23 +104,17 @@ def run_img2img_with_mps_fallback(
             generator,
             device,
             set_progress,
+            extra_kwargs,
         )
         return img, device
     except RuntimeError as error:
         if device == "mps" and is_mps_error(error):
             logger.warning("MPS error detected: %s. Falling back to CPU.", error)
             set_progress("MPS error! Clearing cache and retrying on CPU...")
-            _try_clear_mps_cache()
+            try_empty_device_cache("mps")
             pipeline = reload_on_cpu()
             img = run_img2img(
-                pipeline,
-                image,
-                strength,
-                num_inference_steps,
-                guidance_scale,
-                None,
-                "cpu",
-                set_progress,
+                pipeline, image, strength, num_inference_steps, guidance_scale, None, "cpu", set_progress, extra_kwargs
             )
             return img, "cpu"
         raise
@@ -129,6 +128,7 @@ def _call_pipeline(
     guidance_scale: float,
     generator: Any,
     step_callback: Any,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {
         "prompt": "",
@@ -138,15 +138,24 @@ def _call_pipeline(
         "guidance_scale": guidance_scale,
         "generator": generator,
     }
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
     if step_callback is not None:
         kwargs["callback"] = step_callback
         kwargs["callback_steps"] = 1
     return pipeline(**kwargs)
 
 
-def _try_clear_mps_cache() -> None:
+def try_empty_device_cache(device: str) -> None:
+    """Best-effort free of cached GPU/MPS/XPU memory for ``device``.
+
+    ``torch.<device>.empty_cache()`` exists for cuda/mps/xpu but not cpu (the
+    hasattr guard skips the cpu no-op). Never raises -- callers use it as cleanup
+    (the MPS->CPU fallback here, and the batch loop in watermark_remover).
+    """
     with contextlib.suppress(Exception):
         import torch
 
-        if hasattr(torch, "mps"):
-            torch.mps.empty_cache()  # type: ignore[attr-defined]
+        backend = getattr(torch, device, None)
+        if backend is not None and hasattr(backend, "empty_cache"):
+            backend.empty_cache()  # type: ignore[attr-defined]

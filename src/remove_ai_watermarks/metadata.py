@@ -9,14 +9,21 @@ For metadata-only operations, the heavy ML dependencies are NOT required.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import re
-from typing import TYPE_CHECKING
+import struct
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Smaller scan_head window for the cheap marker checks (has_ai_metadata,
+# samsung_genai); the full-detail scans use scan_head's 1 MB default. Sharing
+# one constant also keeps both call sites on the same memoized cache entry.
+_QUICK_SCAN_BYTES = 512 * 1024
 
 # ── Known AI metadata keys ──────────────────────────────────────────
 
@@ -65,6 +72,22 @@ AI_KEYWORDS: tuple[str, ...] = (
 # Reference: https://spec.c2pa.org/specifications/specifications/2.1/specs/C2PA_Specification.html
 C2PA_UUID: bytes = bytes.fromhex("d8fec3d61b0e483c92975828877ec481")
 
+
+def c2pa_marker_in(data: bytes) -> bool:
+    """True if ``data`` carries a real C2PA manifest marker, not just an
+    incidental 4-byte ``c2pa`` substring.
+
+    A bare ``c2pa`` byte match false-positives on compressed pixel data -- a
+    recompressed PNG IDAT (or any large binary) can contain the bytes ``c2pa``
+    by chance (verified 2026-05-29: 4 cleaned PNGs re-flagged this way after
+    their manifest was correctly stripped). Every real manifest is JUMBF-wrapped
+    (the ``jumb`` box FourCC accompanies the ``c2pa`` content type) or uses the
+    standalone C2PA ``uuid`` box in ISOBMFF, so we require one of those: the
+    joint ``jumb`` + ``c2pa`` match has negligible random-collision probability.
+    """
+    return C2PA_UUID in data or (b"jumb" in data and b"c2pa" in data.lower())
+
+
 # IPTC ``digitalSourceType`` values (IPTC 2025.1) that flag AI provenance.
 # Used by Instagram, Facebook, X (Twitter) to show "Made with AI" labels.
 IPTC_AI_MARKERS: tuple[bytes, ...] = (
@@ -108,6 +131,27 @@ AIGC_MARKERS: tuple[bytes, ...] = (
     b"TC260:AIGC",
 )
 
+# TC260 AIGC-label JSON fields (the standard's labeling object). Doubao writes
+# the same object as a PNG ``tEXt`` chunk keyed ``AIGC`` (raw JSON, not XMP), so
+# a JSON object carrying at least one of these is accepted as a valid TC260
+# label even when the namespaced XMP element is absent.
+_TC260_FIELDS: frozenset[str] = frozenset(
+    {
+        "Label",
+        "ContentProducer",
+        "ProduceID",
+        "ContentPropagator",
+        "PropagateID",
+        "ReservedCode1",
+        "ReservedCode2",
+    }
+)
+
+# HuggingFace-hosted GPU jobs (Jobs / Spaces) stamp generated PNGs with this
+# ``tEXt`` chunk key holding the job UUID. It marks the hosting job, not a
+# specific model -- a medium-confidence AI signal (commonly diffusion output).
+_HF_JOB_KEY: str = "hf-job-id"
+
 STANDARD_METADATA_KEYS: frozenset[str] = frozenset(
     [
         "Author",
@@ -132,6 +176,118 @@ def _is_ai_key(key: str) -> bool:
     return any(kw in key_lower for kw in AI_KEYWORDS)
 
 
+def _is_ai_value(value: str) -> bool:
+    """True if a metadata VALUE carries a known AI-generator token.
+
+    Mirrors :func:`exif_generator`'s value match so removal stays in parity with
+    detection: NovelAI stamps a generic ``Title``/``Source`` text chunk (an
+    AI-shaped value under a non-AI key) that ``_is_ai_key`` alone would keep.
+    """
+    from remove_ai_watermarks.noai.constants import AI_GENERATOR_TOKENS
+
+    value_lower = value.lower()
+    return any(token in value_lower for token in AI_GENERATOR_TOKENS)
+
+
+# PNG ancillary chunks that can carry provenance metadata (XMP, EXIF, text).
+# Never IDAT -- that is the compressed pixel stream.
+_PNG_META_CHUNKS: frozenset[bytes] = frozenset({b"tEXt", b"iTXt", b"zTXt", b"eXIf", b"iCCP"})
+
+
+def _png_late_metadata(image_path: Path, window: int) -> bytes:
+    """Payloads of PNG metadata chunks that start *beyond* the first ``window``
+    bytes, found by seeking past the (large) ``IDAT`` pixel stream.
+
+    A PNG encoder may append the XMP/EXIF packet after the image data, so a
+    fixed first-``size`` read misses it (e.g. a TC260 AIGC label in an XMP
+    ``iTXt`` chunk at ~2.7 MB). This is the PNG analogue of the ISOBMFF
+    late-box scan in :func:`scan_head`. Returns only chunks past ``window`` so
+    bytes already in the head are not duplicated; empty when there are none.
+    """
+    out = bytearray()
+    try:
+        with open(image_path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return b""
+            f.seek(0, 2)
+            file_size = f.tell()
+            pos = 8
+            while True:
+                f.seek(pos)
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                (length,) = struct.unpack(">I", header[:4])
+                chunk_type = header[4:8]
+                if chunk_type == b"IEND":
+                    break
+                data_start = pos + 8
+                # Clamp the attacker-controlled 32-bit length to the bytes that
+                # actually remain, so a malformed huge length can't allocate GBs.
+                safe_length = max(0, min(length, file_size - data_start))
+                if chunk_type in _PNG_META_CHUNKS and data_start >= window:
+                    f.seek(data_start)
+                    out += f.read(safe_length)
+                # Advance by the CLAMPED length: a malformed/inflated `length` that
+                # overshoots EOF must not push `pos` past the file and abort the scan
+                # (which would silently skip a genuine AI-label chunk after it).
+                pos = data_start + safe_length + 4  # data + CRC
+    except OSError as exc:
+        logger.debug("PNG late-metadata scan failed on %s: %s", image_path, exc)
+        return b""
+    return bytes(out)
+
+
+def scan_head(image_path: Path, size: int = 1024 * 1024) -> bytes:
+    """First ``size`` bytes of the file, plus the payloads of any provenance
+    metadata found beyond that window: ISOBMFF ``uuid`` / ``jumb`` boxes (seeking
+    past large boxes like ``mdat``) and PNG ``tEXt`` / ``iTXt`` / ``eXIf`` chunks
+    (seeking past ``IDAT``).
+
+    This is the shared input for every C2PA / AIGC / IPTC byte scan. The
+    extensions catch a manifest or XMP packet placed AFTER the media data -- a
+    non-faststart MP4 manifest, or a PNG XMP packet appended after the pixels --
+    which a fixed first-MB read would miss. For other inputs, and for files that
+    fit within ``size``, it is exactly ``f.read(size)`` -- behavior-neutral.
+
+    The result is memoized per (path, size, mtime): one ``identify``/``get_ai_metadata``
+    call fans out to ~8 byte-scan detectors that each call this on the same file, so
+    the cache turns those repeated reads into one. The mtime key invalidates the entry
+    when the file changes; the small ``maxsize`` bounds memory to a few MB.
+    """
+    try:
+        mtime = image_path.stat().st_mtime_ns
+    except OSError:
+        # No stat (e.g. a pipe, or a race): read uncached rather than fail.
+        return _scan_head_impl(image_path, size)
+    return _scan_head_cached(str(image_path), size, mtime)
+
+
+@functools.lru_cache(maxsize=8)
+def _scan_head_cached(path_str: str, size: int, _mtime_ns: int) -> bytes:
+    """Cache shim: ``_mtime_ns`` is part of the key only (invalidates on change)."""
+    from pathlib import Path as _Path
+
+    return _scan_head_impl(_Path(path_str), size)
+
+
+def _scan_head_impl(image_path: Path, size: int) -> bytes:
+    with open(image_path, "rb") as f:
+        head = f.read(size)
+    # Lazy import: isobmff imports this module's constants at top level.
+    from remove_ai_watermarks.noai import isobmff
+
+    if isobmff.is_isobmff(head):
+        region = isobmff.scan_c2pa_region(image_path)
+        if region:
+            head += region
+    elif head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) == size:
+        # len(head) == size means the file is at least `size` bytes, so metadata
+        # chunks may lie beyond the window; otherwise the whole PNG is in `head`.
+        head += _png_late_metadata(image_path, size)
+    return head
+
+
 def has_ai_metadata(image_path: Path) -> bool:
     """Check if an image contains AI-generation metadata.
 
@@ -143,36 +299,29 @@ def has_ai_metadata(image_path: Path) -> bool:
     """
     from PIL import Image
 
-    # PIL may not handle AVIF/HEIF/JPEG-XL without the optional plugins
-    # (ultralytics also monkey-patches Image.open in a way that can raise
-    # ModuleNotFoundError when pi_heif autoload fails), so any open failure
-    # falls through to the binary scan.
+    # PIL may not handle AVIF/HEIF/JPEG-XL without the optional plugins, and a
+    # third-party plugin autoload can raise a non-OSError (e.g. ModuleNotFoundError),
+    # so any open failure falls through to the binary scan.
     try:
         with Image.open(image_path) as img:
             for key in img.info:
-                if _is_ai_key(key):
+                if isinstance(key, str) and _is_ai_key(key):
                     return True
     except Exception as exc:
         logger.debug("PIL could not open %s for metadata scan: %s", image_path, exc)
 
-    # Check C2PA — via the official ``c2pa`` lib if available, otherwise via a
-    # binary scan that also catches AVIF/HEIF/JPEG-XL containers (PIL doesn't
-    # expose their metadata uniformly).
-    try:
-        from c2pa import has_c2pa_metadata
+    # Check C2PA — via the official c2pa-python reader first (spec-tracking, every
+    # container it supports), then a binary scan that also catches AVIF/HEIF/JPEG-XL
+    # containers and synthetic/partial blobs the validator rejects.
+    from remove_ai_watermarks.noai.c2pa import read_manifest_store_json
 
-        if has_c2pa_metadata(image_path):
-            return True
-    except ImportError:
-        pass
+    if read_manifest_store_json(image_path) is not None:
+        return True
 
     # Binary scan covers C2PA (PNG caBX, JPEG APP11, AVIF/HEIF/JXL uuid boxes)
-    # and IPTC AI markers in XMP. Read only the first 512KB to bound memory.
-    with open(image_path, "rb") as f:
-        data = f.read(512 * 1024)
-    if b"c2pa" in data.lower() or b"C2PA" in data:
-        return True
-    if C2PA_UUID in data:
+    # and IPTC AI markers in XMP. First 512KB (plus late ISOBMFF provenance boxes).
+    data = scan_head(image_path, _QUICK_SCAN_BYTES)
+    if c2pa_marker_in(data):
         return True
     if any(marker in data for marker in AIGC_MARKERS):
         return True
@@ -181,32 +330,205 @@ def has_ai_metadata(image_path: Path) -> bool:
     # IPTC 2025.1 AI-disclosure XMP properties (their presence flags AI content).
     if any(marker in data for marker in IPTC_AI_FIELD_MARKERS):
         return True
+    # China TC260 AIGC label as a PNG text chunk (the byte scan above catches
+    # only the XMP form; the raw-JSON tEXt chunk needs the PIL-based parse).
+    if aigc_label(image_path):
+        return True
+    # HuggingFace-hosted job marker (hf-job-id PNG text chunk).
+    if huggingface_job(image_path):
+        return True
     # xAI / Grok: no C2PA/IPTC/XMP -- only the EXIF Signature + UUID-Artist pair.
     return xai_signature(image_path)
 
 
 def aigc_label(image_path: Path) -> dict[str, str] | None:
-    """Parse a China TC260 ``<TC260:AIGC>`` AI-labeling block, if present.
+    """Parse a China TC260 AI-labeling block, if present.
+
+    Three serializations are recognized:
+
+    - a PNG ``tEXt``/``iTXt`` chunk keyed ``AIGC`` carrying the raw JSON object
+      (as written by Doubao / ByteDance), read via PIL;
+    - an XMP ``<TC260:AIGC>{...}</TC260:AIGC>`` block (HTML-entity encoded text),
+      found by a container-agnostic raw-byte scan (PNG/JPEG/WebP alike); and
+    - a raw-JSON ``{"AIGC":{...}}`` block with no namespace, as embedded in JPEG
+      EXIF (UserComment) by some China-served generators, brace-matched from the
+      scan head; and
+    - a bare ``AIGC{...}`` blob (the label glued straight to its JSON, no
+      ``"AIGC":`` key wrapper) embedded in a JPEG APP segment near the JFIF
+      header by some China-served generators.
 
     Returns the decoded JSON (e.g. ``{"Label": "1", "ContentProducer": ...}``)
-    or None. The block is XMP text (HTML-entity encoded), so it is found by a
-    container-agnostic raw-byte scan and works for PNG/JPEG/WebP alike.
+    or None. The generic forms (the PNG-chunk key ``AIGC``, the bare
+    ``{"AIGC":...}`` object, and the bare ``AIGC{...}`` blob) are accepted only
+    if they carry at least one known TC260 field (``_TC260_FIELDS``); the
+    namespaced XMP element is unambiguous, so any JSON object is accepted.
     """
     import html
     import json
-    import re
+    from typing import cast
 
-    with open(image_path, "rb") as f:
-        data = f.read(1024 * 1024)
-    match = re.search(rb"<TC260:AIGC>(.*?)</TC260:AIGC>", data, re.DOTALL)
-    if not match:
-        return None
-    raw = html.unescape(match.group(1).decode("utf-8", "replace"))
+    def _parse(text: str, *, require_tc260_field: bool) -> dict[str, str] | None:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        fields = {str(k): str(v) for k, v in cast("dict[object, object]", parsed).items()}
+        if require_tc260_field and not (_TC260_FIELDS & fields.keys()):
+            return None
+        return fields
+
+    # PNG tEXt chunk keyed "AIGC" with raw JSON (Doubao and other China gens).
+    # The key is generic, so require a TC260 field to avoid a false positive.
     try:
-        parsed = json.loads(raw)
-    except ValueError:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            value = img.info.get("AIGC")
+    except Exception as exc:
+        logger.debug("PIL could not open %s for AIGC chunk scan: %s", image_path, exc)
+        value = None
+    if isinstance(value, str) and (result := _parse(value, require_tc260_field=True)):
+        return result
+
+    # XMP TC260:AIGC, namespaced (unambiguous) in either serialization RDF allows:
+    # an element  <TC260:AIGC>{...}</TC260:AIGC>  or an attribute  TC260:AIGC="{...}"
+    # (the attribute form is what PicWish writes). Both are HTML-entity encoded.
+    data = scan_head(image_path)
+    match = re.search(
+        rb'<TC260:AIGC>(.*?)</TC260:AIGC>|TC260:AIGC\s*=\s*"(.*?)"',
+        data,
+        re.DOTALL,
+    )
+    if match:
+        body = match.group(1) if match.group(1) is not None else match.group(2)
+        return _parse(html.unescape(body.decode("utf-8", "replace")), require_tc260_field=False)
+
+    # Generic raw-JSON forms the PNG-chunk and XMP paths above both miss, each
+    # gated on a TC260 field: the ``"AIGC":{...}`` key wrapper (as written into
+    # JPEG EXIF UserComment) and the bare ``AIGC{...}`` blob (the label glued
+    # straight to its JSON, no key wrapper, in a JPEG APP segment near the JFIF
+    # header). `raw_decode` brace-matches the inner object (respecting nested
+    # braces / quoted strings); `_parse` applies the same dict coercion + TC260
+    # gate as the PNG-chunk path. A non-matching hit (no TC260 field, or an
+    # undecodable brace) must FALL THROUGH to the next form, never short-circuit:
+    # a quoted ``"AIGC"`` can appear later in an XMP packet while the real label
+    # is a bare ``AIGC{...}`` blob earlier in the file, so an unconditional return
+    # on the quoted form would shadow the bare form.
+    text = data.decode("latin-1")
+    for needle in ('"AIGC"', "AIGC{"):
+        start = text.find(needle)
+        if start == -1:
+            continue
+        # First brace at/after the needle: the object brace for ``"AIGC":{`` and
+        # the glued brace (at start+4) for the bare ``AIGC{`` -- one search covers both.
+        brace = text.find("{", start)
+        if brace == -1:
+            continue
+        try:
+            _, end = json.JSONDecoder().raw_decode(text, brace)
+        except ValueError:
+            continue
+        if result := _parse(text[brace:end], require_tc260_field=True):
+            return result
+    return None
+
+
+# C2PA "Durable Content Credentials" manifest repositories (C2PA 2.4). When the
+# embedded manifest is stripped, an XMP ``dcterms:provenance`` URL can still point
+# at the vendor's cloud manifest store, from which the credentials are recoverable
+# server-side via the file's soft binding. Host -> vendor label. Verified on real
+# files: Adobe's Content Authenticity cloud store.
+_C2PA_MANIFEST_REPOSITORIES: tuple[tuple[bytes, str], ...] = (
+    (b"cai-manifests.adobe.com", "Adobe Content Authenticity"),
+)
+
+
+def c2pa_cloud_manifest_in(data: bytes) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if ``data`` carries an XMP
+    ``dcterms:provenance`` pointer to a known manifest repository, else None.
+
+    The shared byte-scan (mirroring ``soft_binding_vendors_in``), so a caller that
+    already holds the scan head (``identify``) reuses it instead of re-reading.
+    """
+    if b"dcterms:provenance" not in data:
         return None
-    return {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else None
+    for host, vendor in _C2PA_MANIFEST_REPOSITORIES:
+        if host in data:
+            return vendor
+    return None
+
+
+def c2pa_cloud_manifest(image_path: Path) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if the file carries only an XMP
+    ``dcterms:provenance`` pointer to a manifest repository (C2PA 2.4 Durable
+    Content Credentials), else None.
+
+    This fires on the laundering case where the *embedded* manifest was stripped
+    but the XMP cloud reference survives, so the Content Credentials remain
+    recoverable server-side. It is provenance, NOT an AI assertion: the cloud
+    manifest can describe a human edit as easily as an AI generation, and reading
+    its contents needs a network fetch we do not do. ``identify`` surfaces it as a
+    provenance signal without setting ``is_ai_generated``.
+    """
+    return c2pa_cloud_manifest_in(scan_head(image_path, _QUICK_SCAN_BYTES))
+
+
+def huggingface_job(image_path: Path) -> str | None:
+    """Return the HuggingFace job id if the image carries an ``hf-job-id`` PNG
+    text chunk, else None.
+
+    HuggingFace-hosted GPU jobs (Jobs / Spaces) stamp generated PNGs with an
+    ``hf-job-id`` ``tEXt`` chunk holding the job's UUID. It identifies the
+    *hosting job*, not a specific model, and is most commonly seen on diffusion-
+    generation output -- a medium-confidence AI signal, not proof of AI pixels
+    on its own.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            value = img.info.get(_HF_JOB_KEY)
+    except Exception as exc:
+        logger.debug("PIL could not open %s for hf-job-id scan: %s", image_path, exc)
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+# Samsung Galaxy AI editing marker. Galaxy AI tools (Generative Edit, Sketch to
+# Image, Portrait Studio, Drawing Assist, ...) record their re-edit data as a
+# proprietary ``PhotoEditor_Re_Edit_Data`` JSON that carries a ``genAIType``
+# field; a non-zero value flags that a generative-AI tool produced or altered
+# the pixels. The field is undocumented by Samsung (verified 2026-05-29: absent
+# from the C2PA spec and Samsung's public docs/forums), so detection is
+# empirical -- on real Galaxy S23/S24/S25 files it co-occurs with the C2PA
+# ``trainedAlgorithmicMedia`` source type (3/3 of the verified files that record
+# that type), and on a Galaxy S24 sample it is the *only* AI marker (the C2PA
+# source type was absent there). Medium confidence: it signals Galaxy AI editing
+# without proving the whole image is AI-generated. Scoped to the Samsung editor
+# container to avoid matching a stray ``genAIType`` token elsewhere.
+_SAMSUNG_GENAI_RE = re.compile(rb'genAIType"\s*:\s*(-?\d+)')
+_SAMSUNG_EDITOR_MARKER = b"PhotoEditor_Re_Edit_Data"
+
+
+def samsung_genai(image_path: Path) -> int | None:
+    """Return Samsung's non-zero ``genAIType`` value if the image carries the
+    Galaxy AI editing marker, else None.
+
+    See the module note above ``_SAMSUNG_GENAI_RE``: detection is empirical and
+    gated on the ``PhotoEditor_Re_Edit_Data`` container so an incidental
+    ``genAIType`` token cannot false-positive.
+    """
+    head = scan_head(image_path, _QUICK_SCAN_BYTES)
+    if _SAMSUNG_EDITOR_MARKER not in head:
+        return None
+    m = _SAMSUNG_GENAI_RE.search(head)
+    if m is None:
+        return None
+    return int(m.group(1)) or None
 
 
 def iptc_ai_system(image_path: Path) -> str | None:
@@ -219,8 +541,7 @@ def iptc_ai_system(image_path: Path) -> str | None:
     extractable, otherwise the literal ``"fields present"``. Container-agnostic
     raw-byte scan; handles both XMP element and attribute serializations.
     """
-    with open(image_path, "rb") as f:
-        data = f.read(1024 * 1024)
+    data = scan_head(image_path)
     if not any(marker in data for marker in IPTC_AI_FIELD_MARKERS):
         return None
     match = re.search(rb"AISystemUsed[=:\s]*[\"'>]\s*([^<\"']{1,120})", data)
@@ -259,9 +580,8 @@ def synthid_source(image_path: Path) -> str | None:
     # Non-PNG containers (JPEG APP11, WebP, AVIF/HEIF/JXL uuid box) keep the
     # C2PA manifest where the PNG parser can't reach it. Binary-scan for the
     # same signal: a C2PA manifest from a SynthID-using issuer on AI content.
-    with open(image_path, "rb") as f:
-        data = f.read(1024 * 1024)
-    has_c2pa = b"c2pa" in data.lower() or C2PA_UUID in data
+    data = scan_head(image_path)
+    has_c2pa = c2pa_marker_in(data)
     # Matches both "trainedAlgorithmicMedia" and "compositeWithTrainedAlgorithmicMedia".
     ai_source = b"trainedAlgorithmicMedia" in data or b"TrainedAlgorithmicMedia" in data
     if not (has_c2pa and ai_source):
@@ -272,12 +592,15 @@ def synthid_source(image_path: Path) -> str | None:
 
 def exif_generator(image_path: Path) -> str | None:
     """Return an AI-generator name from the EXIF ``Software`` / XMP ``CreatorTool``
-    field, if it matches a known generator (see ``AI_GENERATOR_TOKENS``), else None.
+    field (or a PNG text chunk), if it matches a known generator (see
+    ``AI_GENERATOR_TOKENS``), else None.
 
     Cross-format: EXIF is read via PIL + piexif for any container PIL can open
     (JPEG/WebP/AVIF/PNG); an XMP ``CreatorTool`` raw-byte scan additionally covers
-    HEIF/JPEG-XL that PIL can't open without plugins. Only AI tokens match, so
-    ordinary editors (plain "Adobe Photoshop", "GIMP") are not flagged.
+    HEIF/JPEG-XL that PIL can't open without plugins. PNG ``tEXt`` chunks are read
+    too -- NovelAI stamps its generator in ``Software``/``Source``/``Title`` text
+    chunks rather than EXIF. Only AI tokens match, so ordinary editors (plain
+    "Adobe Photoshop", "GIMP") are not flagged.
     """
     import re
 
@@ -285,13 +608,21 @@ def exif_generator(image_path: Path) -> str | None:
 
     candidates: list[str] = []
 
-    # EXIF Software / Artist / ImageDescription (0th IFD) via PIL exif bytes.
+    # EXIF Software / Artist / ImageDescription (0th IFD) via PIL exif bytes,
+    # plus PNG text chunks (NovelAI writes Software/Source/Title there, not EXIF).
     try:
         import piexif
         from PIL import Image
 
         with Image.open(image_path) as img:
-            exif_bytes = img.info.get("exif")
+            info = img.info
+            exif_bytes = info.get("exif")
+            # PNG tEXt/iTXt chunks land in img.info too (same idiom as the other
+            # PNG-text readers in this module); NovelAI stamps Software/Source/Title.
+            for key in ("Software", "Source", "Title", "Description"):
+                value = info.get(key)
+                if isinstance(value, str) and value:
+                    candidates.append(value)
         if exif_bytes:
             tags = piexif.load(exif_bytes).get("0th", {})
             # Make catches camera-style tags AI tools reuse (Ideogram writes
@@ -311,8 +642,7 @@ def exif_generator(image_path: Path) -> str | None:
 
     # XMP CreatorTool: text, container-agnostic (covers HEIF/JXL via raw scan).
     try:
-        with open(image_path, "rb") as f:
-            head = f.read(1024 * 1024)
+        head = scan_head(image_path)
         for match in re.finditer(rb"CreatorTool[>\"'=\s]{1,4}([^<\"']{1,80})", head):
             candidates.append(match.group(1).decode("latin1", "replace"))
     except Exception as exc:
@@ -336,7 +666,7 @@ def _is_xai_signature_pair(description: str, artist: str) -> bool:
     return _XAI_SIGNATURE_RE.match(description) is not None and _UUID_RE.fullmatch(artist) is not None
 
 
-def _exif_text(ifd: dict, tag: int) -> str:
+def _exif_text(ifd: dict[int, Any], tag: int) -> str:
     """Decode a piexif 0th-IFD byte tag to a stripped string ('' if absent)."""
     value = ifd.get(tag)
     return value.decode("latin1", "replace").strip() if isinstance(value, bytes) else ""
@@ -372,7 +702,7 @@ def xai_signature(image_path: Path) -> bool:
     )
 
 
-def _scrub_ai_exif(exif_dict: dict) -> list[str]:
+def _scrub_ai_exif(exif_dict: dict[str, Any]) -> list[str]:
     """Delete AI-provenance tags from a piexif dict's ``0th`` IFD, in place.
 
     Removes (a) the xAI/Grok signature pair (``ImageDescription`` "Signature: ..."
@@ -430,13 +760,13 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
 
     result: dict[str, str] = {}
 
-    # PIL may not open AVIF/HEIF/JPEG-XL without optional plugins (and
-    # ultralytics' Image.open patch can raise ModuleNotFoundError); fall through
-    # to the C2PA/binary path on any open failure. See CLAUDE.md.
+    # PIL may not open AVIF/HEIF/JPEG-XL without optional plugins (and a
+    # third-party plugin autoload can raise a non-OSError); fall through to the
+    # C2PA/binary path on any open failure. See CLAUDE.md.
     try:
         with Image.open(image_path) as img:
             for key, value in img.info.items():
-                if _is_ai_key(key):
+                if isinstance(key, str) and _is_ai_key(key):
                     if isinstance(value, bytes):
                         result[key] = f"<binary {len(value)} bytes>"
                     elif isinstance(value, str) and len(value) > 200:
@@ -467,8 +797,7 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
     if "synthid_watermark" not in result and (vendor := synthid_source(image_path)):
         result.setdefault("synthid_watermark", synthid_verdict(vendor))
     if "soft_binding" not in result:
-        with open(image_path, "rb") as f:
-            head = f.read(1024 * 1024)
+        head = scan_head(image_path)
         if vendors := soft_binding_vendors_in(head):
             result["soft_binding"] = ", ".join(vendors)
 
@@ -484,6 +813,13 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
     # IPTC 2025.1 AI-disclosure XMP fields (Iptc4xmpExt:AISystemUsed etc.).
     if system := iptc_ai_system(image_path):
         result.setdefault("ai_system", f"IPTC 2025.1 AI disclosure ({system})")
+
+    # HuggingFace-hosted job marker (hf-job-id PNG text chunk).
+    if job := huggingface_job(image_path):
+        result.setdefault("huggingface_job", f"HuggingFace-hosted job ({job})")
+    # Samsung Galaxy AI editing marker (genAIType in PhotoEditor_Re_Edit_Data).
+    if (genai := samsung_genai(image_path)) is not None:
+        result.setdefault("samsung_genai", f"Samsung Galaxy AI editing marker (genAIType={genai})")
     return result
 
 
@@ -507,10 +843,18 @@ def _strip_with_ffmpeg(source_path: Path, output_path: Path) -> Path:
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-i", str(source_path),
-        "-map_metadata", "-1", "-map_chapters", "-1",
-        "-c", "copy",
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-c",
+        "copy",
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
@@ -551,16 +895,34 @@ def remove_ai_metadata(
     # codestream bit-for-bit. MP4/MOV/M4A are ISOBMFF too, so the same top-level
     # uuid/jumb box walker applies. Route by suffix OR by an ``ftyp`` content
     # sniff, so a correctly-shaped container is handled whatever its extension.
-    from remove_ai_watermarks.noai.isobmff import is_isobmff, strip_c2pa_boxes
+    from remove_ai_watermarks.noai.isobmff import (
+        blank_ai_exif_tokens,
+        blank_ai_xmp_packets,
+        is_isobmff,
+        strip_c2pa_boxes,
+    )
 
     with open(source_path, "rb") as f:
         head = f.read(12)
     if source_path.suffix.lower() in _ISOBMFF_EXTS or is_isobmff(head):
         data = source_path.read_bytes()
+        # Top-level uuid/jumb boxes (C2PA + AI-label XMP), then the meta-box items
+        # the top-level stripper can't reach (HEIF/AVIF store them in mdat/idat):
+        # AI-label XMP packets and AI-generator tokens in an Exif item -- both
+        # blanked in place (same length) so box sizes and iloc offsets stay valid
+        # and the coded image is untouched.
         cleaned, stripped = strip_c2pa_boxes(data)
+        cleaned, blanked = blank_ai_xmp_packets(cleaned)
+        cleaned, exif_blanked = blank_ai_exif_tokens(cleaned)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(cleaned)
-        logger.info("Stripped %d AI-provenance box(es) → %s", stripped, output_path)
+        logger.info(
+            "Stripped %d AI-provenance box(es), blanked %d meta-box XMP packet(s) + %d EXIF token(s) → %s",
+            stripped,
+            blanked,
+            exif_blanked,
+            output_path,
+        )
         return output_path
 
     # Non-ISOBMFF audio/video (WebM/Matroska EBML, MP3 ID3, WAV/FLAC/OGG): the
@@ -574,11 +936,23 @@ def remove_ai_metadata(
         img = img.copy()
         fmt = output_path.suffix.lower()
 
-        save_kwargs: dict = {}
+        save_kwargs: dict[str, Any] = {}
         if fmt in (".jpg", ".jpeg"):
             save_kwargs["format"] = "JPEG"
+            # JPEG output is unavoidably lossy, so minimize the loss: high quality
+            # and no chroma subsampling (4:4:4). Without these PIL defaults to
+            # quality 75 + 4:2:0, which visibly degrades a re-saved image.
+            save_kwargs["quality"] = 95
+            save_kwargs["subsampling"] = 0
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
+        elif fmt == ".webp":
+            # Preserve the WebP container losslessly instead of silently rewriting
+            # it as PNG (which changes the format and bloats the file).
+            save_kwargs["format"] = "WEBP"
+            save_kwargs["lossless"] = True
+            if img.mode == "P":  # WebP cannot encode palette mode
+                img = img.convert("RGBA" if "transparency" in img.info else "RGB")
         else:
             save_kwargs["format"] = "PNG"
 
@@ -587,7 +961,14 @@ def remove_ai_metadata(
         exif_data = None
 
         for key, value in img.info.items():
+            if not isinstance(key, str):
+                continue
             if _is_ai_key(key):
+                continue
+            # Drop a generic text chunk whose VALUE names an AI generator (NovelAI
+            # writes its stamp into Title/Source under non-AI keys) -- keeps removal
+            # in parity with exif_generator's value-based detection.
+            if isinstance(value, str) and _is_ai_value(value):
                 continue
             if key == "exif":
                 with contextlib.suppress(Exception):

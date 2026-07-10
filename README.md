@@ -8,22 +8,35 @@ Strips SynthID, C2PA Content Credentials, EXIF/XMP "Made with AI" labels, and vi
 >
 > No Python, no GPU, no setup. Visible-watermark and metadata removal are **free**. Invisible-watermark removal (SynthID / SDXL regeneration) normally needs a local GPU and ~2 GB of models. On **[raiw.cc](https://raiw.cc)** it runs on cloud GPUs in one click for a small per-image fee.
 
+[![PyPI](https://img.shields.io/pypi/v/remove-ai-watermarks?logo=pypi&logoColor=white)](https://pypi.org/project/remove-ai-watermarks/)
+[![Python](https://img.shields.io/pypi/pyversions/remove-ai-watermarks?logo=python&logoColor=white)](https://pypi.org/project/remove-ai-watermarks/)
+[![Downloads](https://static.pepy.tech/badge/remove-ai-watermarks/month)](https://pepy.tech/project/remove-ai-watermarks)
+[![License](https://img.shields.io/pypi/l/remove-ai-watermarks?color=blue)](LICENSE)
+[![Tests](https://github.com/wiltodelta/remove-ai-watermarks/actions/workflows/test.yml/badge.svg)](https://github.com/wiltodelta/remove-ai-watermarks/actions/workflows/test.yml)
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/wiltodelta)
 
 If this tool saves you time, consider [sponsoring its development](https://github.com/sponsors/wiltodelta).
 
+> **Intended for lawful use only.** Publishing and running this software is lawful; responsibility for any downstream use, and for compliance with local law, rests entirely with the user. Some jurisdictions restrict removing an AI label as such (see [Legal](#legal)). The authors do not condone use for deception, fraud, or any unlawful activity.
+
+## Scope
+
+This tool removes **AI-provenance watermarks** that a platform stamps onto content **you generated yourself** — SynthID, the Gemini / Nano Banana sparkle, the Doubao / Jimeng / Samsung visible AI labels, the Chinese TC260 "由…AI生成" label, and C2PA / IPTC / EXIF "Made with AI" metadata. The point is your autonomy over your own output.
+
+It does **not** target watermarks that protect someone else's paid or copyrighted content — stock-agency overlays (Shutterstock, Getty, iStock, Adobe Stock), classifieds-site marks, or any tiled "preview" watermark whose job is to gate a purchase. Removing those is out of scope by design. `erase` is a generic, user-driven region tool for your own objects, not an automatic stock-watermark remover.
+
 ## Features
 
-- **Visible watermark removal** — Gemini / Nano Banana sparkle logo (reverse alpha blending) and the Doubao "豆包AI生成" text strip (locate + mask + inpaint); fast, offline, deterministic, no GPU. `visible --mark auto` picks the right one
+- **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each is removed by **reverse-alpha blending** against a captured alpha map (`original = (wm − α·logo)/(1−α)`), recovering the true pixels rather than inpainting a guess. The Gemini sparkle recovers cleanly on its own on bright backgrounds; it adapts the alpha to each image's sparkle opacity, so a more-opaque-than-captured sparkle is still fully removed (and on a dark background, where the fixed alpha would over-subtract and leave a dark spot, it automatically inpaints the small sparkle footprint instead); the Doubao, Jimeng, and Samsung text marks re-rasterize slightly per image, so a thin residual inpaint over the glyph footprint clears the leftover edges (the alpha maps are reproducibly rebuilt from controlled captures by `scripts/visible_alpha_solve.py`). Fast, offline, no GPU. `visible --mark auto` finds and removes the strongest detected mark. (For arbitrary logos/objects, see `erase`.)
 - **Universal region eraser (`erase`)** — remove any logo / watermark / object inside boxes you specify, regardless of position or colour. Default cv2 inpainting (CPU, instant); optional big-LaMa via onnxruntime (`lama` extra) for higher quality
 - **Invisible watermark removal** — SynthID, StableSignature, TreeRing via diffusion-based regeneration (needs a local GPU, or run it with no setup on [raiw.cc](https://raiw.cc))
-- **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, and **MP4 / MOV / M4V video** at the container level), XMP DigitalSourceType
-- **"Made with AI" label removal** — removes the metadata that triggers AI labels on Instagram, Facebook, X (Twitter)
-- **Analog Humanizer** — film grain and chromatic aberration to bypass AI image classifiers
-- **Smart Face Protection** — automatic extraction and blending of human faces to prevent AI distortion
+- **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
+- **"Made with AI" label removal** — removes the AI-disclosure metadata that platforms read to apply automatic labels (useful for clearing a false-positive label from a human-edited photograph)
+- **Analog Humanizer** — optional film grain and chromatic aberration post-processing
+- **Text and face preservation (default)** — the default pipeline is a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Use `--pipeline sdxl` for plain SDXL img2img (lighter, no extra model download) on inputs without text or faces. An experimental `--pipeline qwen` runs Qwen-Image (20B, Apache-2.0) img2img, which preserves **text** (including CJK and small text) better than SDXL at equal strength; it is CUDA/cloud-class (does not fit MPS), and its strength floors are not yet certified (pass an explicit `--strength`, especially for Gemini content). Note: measured fidelity (`scripts/fidelity_metrics.py`) shows Qwen wins on text but controlnet preserves **faces** better (Qwen smooths skin more), so Qwen is not a universal upgrade. Canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness). The library does not ship a face-restore extra: every approach evaluated (GFPGAN-on-cleaned, PhotoMaker-V2, InstantID txt2img, InstantID img2img-on-cleaned) regenerated the face via SDXL and made the output look more AI-generated than the cleaned image. The cleaned controlnet output is the least-AI face state achievable without re-introducing SynthID.
 - **Batch processing** — process entire directories
 - **Detection** — three-stage NCC watermark detection with confidence scoring
-- **Provenance detection (`identify`)** — aggregate C2PA issuer, the C2PA soft-binding forensic-watermark vendor (Adobe TrustMark, Digimarc, Imatag, ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, embedded SD/ComfyUI params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the SynthID metadata proxy, the visible sparkle, the open SD/SDXL/FLUX invisible watermark, and (with the `trustmark` extra) the open Adobe TrustMark watermark into one origin-platform + watermark-inventory verdict (`--json` for machine output)
+- **Provenance detection (`identify`)** — aggregate C2PA issuer, the C2PA soft-binding forensic-watermark vendor (Adobe TrustMark, Digimarc, Imatag, ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, embedded SD/ComfyUI params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the China TC260 AIGC label (XMP, PNG chunk, EXIF, or JPEG segment), the HuggingFace `hf-job-id` job marker, the SynthID metadata proxy, the C2PA cloud-manifest reference (Adobe Durable Content Credentials, when the embedded manifest is stripped), the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" / Samsung Galaxy AI "Contenuti generati dall'AI" text marks), the open SD/SDXL/FLUX invisible watermark, and (with the `trustmark` extra) the open Adobe TrustMark watermark into one origin-platform + watermark-inventory verdict (`--json` for machine output)
 
 ## Examples
 
@@ -46,13 +59,16 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 | **xAI Grok (Aurora)** | — | — | ✅ EXIF signature scheme (no C2PA): `Signature:` blob + UUID `Artist` | Detected (`identify`); metadata strip |
 | **Midjourney** | — | — | ✅ EXIF + XMP (prompt, model, seed) | Metadata strip |
 | **Meta AI** | — | — | ✅ IPTC "Made with AI" (digitalSourceType) | Metadata strip (removes the label) |
-| **Doubao** (ByteDance) / China AIGC generators | ✅ "豆包AI生成" text strip (bottom-right) | — | ✅ TC260 `<TC260:AIGC>` XMP label (China's mandatory AI labeling) | Locate + mask + inpaint (cv2, CPU) + metadata strip |
+| **Doubao** (ByteDance) / China AIGC generators | ✅ "豆包AI生成" text strip (bottom-right) | — | ✅ TC260 AIGC label (`<TC260:AIGC>` XMP, `AIGC` PNG chunk, or EXIF JSON) **+ C2PA** signed by ByteDance Volcano Engine (`volcengine`) | Reverse-alpha (captured α map) + thin residual inpaint, NCC-aligned across resolutions, + metadata strip |
+| **Jimeng / Dreamina** (即梦AI, ByteDance) | ✅ "★ 即梦AI" wordmark (bottom-right) | — | ✅ TC260 AIGC label + C2PA (Volcano Engine) | Reverse-alpha (captured α map) + residual inpaint over the glyph footprint, NCC-aligned across resolutions, + metadata strip |
+| **Samsung Galaxy AI** (Generative Edit, Sketch to Image, ...) | ✅ "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific) | — | ✅ C2PA (signer "Samsung Galaxy") + `trainedAlgorithmicMedia` / proprietary `genAIType` marker | Reverse-alpha (captured α map) + thin residual inpaint, NCC-aligned across resolutions, + metadata strip |
+| **Black Forest Labs** (FLUX API) | — | — | ✅ C2PA (`Black Forest Labs API` + `c2pa.ai_generated_content` + `trainedAlgorithmicMedia`) | Metadata strip |
 | **StableSignature** (Meta) | — | ✅ In-model watermark | — | Diffusion regeneration |
 | **TreeRing** | — | ✅ Latent space watermark | — | Diffusion regeneration |
 
-> Visible overlays are used by Google Gemini / Nano Banana (sparkle logo) and by Doubao / China AIGC generators (the mandated "...AI生成" corner text). Both are removed deterministically on CPU. Other services rely on invisible watermarks and/or metadata; our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain. For a visible mark from any other source (any position, any colour), use the universal `erase --region` command.
+> Visible overlays are used by Google Gemini / Nano Banana (sparkle logo), by ByteDance's Doubao ("豆包AI生成" corner text) and Jimeng / Dreamina ("★ 即梦AI" wordmark), and by Samsung Galaxy AI ("✦ Contenuti generati dall'AI" strip, bottom-left, locale-specific). All are removed on CPU by reverse-alpha against a captured alpha map (Jimeng and Samsung add a thin residual inpaint over the glyph footprint, since their marks re-rasterize per image). Other services rely on invisible watermarks and/or metadata; our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain. For a visible mark from any other source (any position, any colour), use the universal `erase --region` command.
 
-> **Detection:** `remove-ai-watermarks identify <image>` reports the origin platform and watermark inventory for all the signals above — C2PA issuer, the C2PA soft-binding forensic-watermark vendor (TrustMark / Digimarc / Imatag / ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, the China TC260 AIGC label, embedded generation params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the SynthID metadata proxy, the visible sparkle, and (with the `[detect]` / `[trustmark]` extras) the open SD/SDXL/FLUX and Adobe TrustMark invisible watermarks. SynthID and the proprietary soft-binding watermarks (Digimarc etc.) have no local decoder, so they are reported by metadata proxy / vendor name only.
+> **Detection:** `remove-ai-watermarks identify <image>` reports the origin platform and watermark inventory for all the signals above — C2PA issuer, the C2PA soft-binding forensic-watermark vendor (TrustMark / Digimarc / Imatag / ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, the China TC260 AIGC label (XMP, PNG chunk, EXIF, or JPEG segment), the HuggingFace `hf-job-id` job marker, embedded generation params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the SynthID metadata proxy, the C2PA cloud-manifest reference (Adobe Durable Content Credentials, when the embedded manifest is stripped), the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" / Samsung Galaxy AI "Contenuti generati dall'AI" text marks), and (with the `[detect]` / `[trustmark]` extras) the open SD/SDXL/FLUX and Adobe TrustMark invisible watermarks. SynthID and the proprietary soft-binding watermarks (Digimarc etc.) have no local decoder, so they are reported by metadata proxy / vendor name only.
 
 ## How it works
 
@@ -76,9 +92,27 @@ A three-stage NCC (Normalized Cross-Correlation) detector finds the watermark po
 
 ### Removing the Doubao "豆包AI生成" text watermark
 
-Doubao (ByteDance) stamps every output with a light, semi-transparent "豆包AI生成" text strip in the bottom-right corner — the visible AIGC label mandated by China's TC260 standard. Unlike the fixed-size Gemini sparkle, it is a text strip that scales with image width, so we anchor a generous bottom-right box by geometry, extract the light low-saturation glyph pixels with a polarity-aware white top-hat mask, and inpaint them (cv2 Telea/NS). The mask is background-relative, so it leaves white-paper documents untouched instead of smearing their text. On dense-text backgrounds where the mask would explode, removal is skipped rather than guessed.
+Doubao (ByteDance) stamps every output with a light, semi-transparent "豆包AI生成" text strip in the bottom-right corner — the visible AIGC label mandated by China's TC260 standard. It is a fixed semi-transparent white overlay, so it is removed by **reverse-alpha blending**: `original = (watermarked - α·logo) / (1 - α)`, recovering the true pixels instead of hallucinating them. The α map is solved from controlled black/gray captures (rebuildable with `scripts/visible_alpha_solve.py`). Like the Jimeng mark, Doubao re-rasterizes its text slightly per image, so reverse-alpha is followed by a thin residual inpaint over the glyph footprint to clear the leftover edges, and the α template is NCC-aligned to the actual mark (handling per-image scale/position jitter). Detection matches the same glyph silhouette against the corner (normalized correlation), so it keys on the "豆包AI生成" shape, not on textured corners.
 
-**Speed**: ~0.03s per image. No GPU needed. Best on photo / illustration backgrounds; on high-contrast edges a faint residue can remain (use `erase --backend lama` for neural-quality fill).
+**Speed**: ~0.05s, no GPU needed.
+
+### Removing the Jimeng "★ 即梦AI" wordmark
+
+Jimeng / Dreamina (即梦AI, also ByteDance, distinct from Doubao) stamps a "★ 即梦AI" wordmark — a four-point sparkle followed by the 即梦AI characters — in the bottom-right corner. It is a fixed semi-transparent **pure-white** overlay, solved from controlled black / gray / white captures the same way as Doubao. `visible --mark auto` detects and removes it (or force it with `--mark jimeng`). One difference from Doubao: Jimeng re-rasterizes its mark slightly differently per image, so a single alpha map does not cancel it pixel-for-pixel — reverse-alpha knocks the mark down and a residual inpaint over the glyph footprint clears the remaining outline. The two ByteDance marks do not confuse `auto`: detection keys on each mark's own glyph shape (the Jimeng detector scores far below its threshold on a Doubao strip, and vice versa).
+
+```bash
+remove-ai-watermarks visible jimeng.png -o clean.png            # --mark auto picks Jimeng
+remove-ai-watermarks visible jimeng.png --mark jimeng -o clean.png
+```
+
+### Removing the Samsung Galaxy AI "✦ Contenuti generati dall'AI" mark
+
+Samsung's on-device Generative AI edits (Generative Edit, Sketch to Image, Portrait Studio) burn a visible sparkle + "generated with AI" string into the **bottom-left** corner — a faint, low-opacity semi-transparent white overlay. It is solved from controlled black / gray / white captures the same way as Jimeng and removed by reverse-alpha plus a thin residual inpaint over the glyph footprint (the mark re-rasterizes per image, and the flat captures are smaller than real photos, so the alpha template is NCC-aligned and width-scaled to the actual mark). `visible --mark auto` detects and removes it (or force it with `--mark samsung`); being bottom-left it never confuses the bottom-right Gemini/Doubao/Jimeng marks. The string is **locale-specific** — this build is calibrated for the Italian "Contenuti generati dall'AI" variant; other locales need their own captured template (open a sample on issue #37).
+
+```bash
+remove-ai-watermarks visible samsung.jpg -o clean.jpg            # --mark auto picks Samsung
+remove-ai-watermarks visible samsung.jpg --mark samsung -o clean.jpg
+```
 
 ### Universal region eraser
 
@@ -93,15 +127,27 @@ The removal pipeline (default profile, SDXL):
 ```text
 image → encode to latent space (VAE) at native resolution
       → add controlled noise (forward diffusion)
-      → denoise (reverse diffusion, ~50 steps at strength 0.05)
+      → denoise (reverse diffusion, ~50 steps; strength is vendor-adaptive:
+        0.20 OpenAI / 0.30 Google / 0.30 unknown, same for both pipelines;
+        override with --strength)
       → decode back to pixels (VAE)
 ```
 
-By default the image is processed at its **native resolution** with no pre-downscale, matching the hosted raiw.cc backend (fal `fast-sdxl`, which is `stabilityai/stable-diffusion-xl-base-1.0` — the same checkpoint the CLI defaults to). At strength ~0.05 SDXL img2img does not need the input shrunk, and the old forced downscale-to-1024 then upscale-back round-trip was the main quality loss. Pass `--max-resolution N` to cap the long side only when a very large image runs out of GPU/MPS memory (it reintroduces that lossy round-trip).
+- Large inputs run at native resolution (no down-then-up round-trip, which was the main quality loss in issue #10); use `--max-resolution N` only to cap GPU/MPS memory on very large inputs. For inputs that run out of GPU/MPS memory at native resolution, `--tile` is the lossless alternative to `--max-resolution`: it regenerates the image in overlapping, feather-blended tiles (each near SDXL's 1024 px size) so there is no downscale and no visible seam. It engages only when the long side exceeds `--tile-size` (default 1024; overlap `--tile-overlap`, default 128); pair it with `--max-resolution 0`. Small inputs (long side under 1024 px) are auto-upscaled to a 1024 px floor before diffusion, because SDXL distorts on a tiny latent, and the result is restored to the original size (a transparent quality boost). Disable the floor with `--min-resolution 0`. The floor upscale uses Lanczos by default; `--upscaler esrgan` (the `esrgan` extra) runs Real-ESRGAN first for sharper detail and falls back to Lanczos if the extra is absent. ESRGAN is a generic photo/texture GAN with no face/glyph prior, so it is best for photo/texture content -- it can degrade faces (the diffusion pass regenerates them, so the final recovers) and thin text; keep Lanczos for text-heavy inputs.
+
+> **Default strength is vendor-adaptive (no flag needed).** The tool reads the C2PA issuer to detect which vendor's SynthID is present and picks the strength accordingly: **OpenAI gpt-image → `0.20`**, **Google Gemini → `0.30`**, **unknown source → `0.30`**. The **same ladder applies to both pipelines** — these are the oracle-certified `controlnet` floors (June 2026 Modal cert, multi-seed). They also cover plain `sdxl`: the two pipelines have opposite hard cases (controlnet leaves SynthID on photoreal, sdxl on flat graphics), but on its own hard case sdxl is the weaker remover, so it needs at least controlnet's strength — using one certified ladder is the safe choice (margin-based for sdxl, not separately certified). The dominant factor is the vendor (Google's SynthID is ~3x more robust). There is no local SynthID detector, so if the oracle still reads SynthID, raise `--strength`; if you care more about preserving fine detail, lower it. (Caveat: Google's `0.30` was validated only at `--max-resolution 1536`; a very large native Gemini image may need ~`0.35`+.)
+>
+> **The default pipeline is `controlnet` — it preserves text and face structure.** It runs the same SDXL img2img scrub but adds a canny ControlNet that conditions the regeneration on the image's edge map, so text and structure stay sharp at the strengths that remove SynthID. The watermark removal still comes from the img2img regeneration (`--strength`); the ControlNet only preserves structure — no original pixels are copied or frozen. The default strength ladder (OpenAI `0.20` / Google `0.30`) is the oracle-certified controlnet floor. `--controlnet-scale` tunes the preservation strength (higher = closer to the original structure). Runs fp32 on mps/cpu (fp16 only on cuda/xpu, where the fp16-fixed SDXL VAE is loaded automatically). Pass `--pipeline sdxl` for plain SDXL img2img (lighter, no extra model download) on inputs without text or faces.
+>
+> **No face-restore extra in the library.** Every ArcFace-based regeneration approach we evaluated (GFPGAN-on-cleaned, PhotoMaker-V2, InstantID txt2img, InstantID img2img-on-cleaned at three parameter sweeps, 2026-06-04 - 2026-06-08 Modal cert sweeps) regenerated the face via SDXL diffusion — the output face pixels were diffusion-fresh (SynthID not re-introduced), but the face inherently looked more AI-generated than the cleaned image (SDXL "clean skin" gloss, lost original identity precision). The cleaned image from the main controlnet 0.20 pass is the least-AI face state we can reach without re-introducing SynthID. Empirical conclusion in `docs/synthid-robust-identity-research-2026-06-08.md`.
 
 SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 Pro outputs, where the older SD-1.5 pipeline at 768 px did not. The SD-1.5 path was removed once it was verified not to handle v2. Note the scope: this defeats the SynthID *verifier*, which is not the same as being forensically indistinguishable from a real photo. Recent work ([arXiv:2605.09203](https://arxiv.org/abs/2605.09203)) shows watermark-removal pipelines leave detectable traces, so a separate "this image was processed" classifier can still flag the output.
 
-**Face Protection**: before diffusion, YOLO detects people in the image and extracts them. After diffusion, the original faces are blended back with a soft elliptical mask to prevent AI distortion of facial features.
+> **Oracle vs `identify` can disagree, and that is expected.** An online verifier reads the actual SynthID *pixel* watermark and detects only its own vendor's content — [openai.com/research/verify](https://openai.com/research/verify/) states "OpenAI generation signals will only be detected if the image was generated with our tools". Our `identify` cannot decode the pixel watermark (no vendor ships a local decoder), so it infers SynthID from the **C2PA metadata** instead. So after the SDXL pass the oracle can read "no SynthID" (pixel watermark gone) while `identify` still reports SynthID from a surviving C2PA manifest. They measure different signals. Run `metadata --remove` (or `all`) to also strip the manifest; note that a quiet metadata proxy is not proof the pixel watermark itself is gone.
+
+> **Technical deep-dive:** see [`docs/synthid.md`](docs/synthid.md) for a primary-source-cited breakdown of how SynthID works mechanically (post-hoc encoder/decoder, 136-bit payload, pixel-space embedding), what it empirically survives (JPEG, crop, resize: ~99.98% TPR at 0.1% FPR from arXiv:2510.09263), what removes it, and the forensic-stealth tradeoff (all known removal attacks are detectable at >98% TPR@1%FPR per arXiv:2605.09203).
+
+**Text and face preservation** (the default pipeline; `--pipeline sdxl` opts down to plain SDXL): a canny ControlNet keeps text and face *structure* sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity*: the regenerated face drifts in likeness. The library does not ship a face-restore extra (see the callout above).
 
 **Analog Humanizer**: optional film grain and chromatic aberration injection that mimics a photo of a screen, raising the bar for AI-generated image classifiers. (It frustrates generic classifiers but does not guarantee forensic invisibility — see the [arXiv:2605.09203](https://arxiv.org/abs/2605.09203) note above.)
 
@@ -117,6 +163,34 @@ AI tools embed generation metadata that social platforms use to show "Made with 
 The cleaner parses each layer, removes AI-related fields, and preserves standard metadata (Author, Copyright, Title).
 
 ## Installation
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install wiltodelta/tap/remove-ai-watermarks
+```
+
+This installs the core command surface (`identify`, `metadata`, `visible`,
+`erase`) as a self-contained CLI. The diffusion-based `invisible` / `all`
+pipeline needs heavy ML dependencies (torch, diffusers, multi-GB) and is kept
+out of the Homebrew build; add it with the `gpu` extra via pip if you need it:
+
+```bash
+pip install "remove-ai-watermarks[gpu]"
+```
+
+### conda
+
+A conda-forge recipe is under review
+([staged-recipes PR](https://github.com/conda-forge/staged-recipes/pull/33674)).
+Once it merges, the core package installs with:
+
+```bash
+conda install -c conda-forge remove-ai-watermarks
+```
+
+Like the Homebrew build, this is the core command surface; add the diffusion
+`invisible` / `all` pipeline with the pip `gpu` extra.
 
 ### Recommended
 
@@ -164,6 +238,10 @@ After installation the `remove-ai-watermarks` command is available system-wide.
 > pip install -e ".[gpu]"   # or: uv pip install -e ".[gpu]"
 > ```
 >
+> Without the `[gpu]` extra, `all` still runs the visible and metadata steps, but
+> it skips the invisible (SynthID) step, prints a clear warning, and exits with a
+> non-zero status so a skipped step is not mistaken for a clean result.
+>
 > To let `identify` decode the open Stable Diffusion / SDXL / FLUX invisible
 > watermarks, install the `detect` extra (adds the `invisible-watermark` decoder):
 >
@@ -177,6 +255,14 @@ After installation the `remove-ai-watermarks` command is available system-wide.
 >
 > ```bash
 > pip install -e ".[trustmark]"   # or: uv pip install -e ".[trustmark]"
+> ```
+>
+> For sharper upscaling of small inputs before diffusion (`--upscaler esrgan`,
+> Real-ESRGAN), install the `esrgan` extra. It loads via spandrel (MIT, no basicsr);
+> the Real-ESRGAN weights (BSD-3-Clause) download on first use:
+>
+> ```bash
+> pip install -e ".[esrgan]"   # or: uv pip install -e ".[esrgan]"
 > ```
 
 #### Invisible watermark removal
@@ -208,6 +294,23 @@ pytest
 ./maintain.sh
 ```
 
+## ComfyUI
+
+Custom nodes are available so the watermark tools run inside a ComfyUI graph:
+[ComfyUI-remove-ai-watermarks](https://github.com/wiltodelta/ComfyUI-remove-ai-watermarks)
+([registry](https://registry.comfy.org/nodes/remove-ai-watermarks)).
+
+Install via ComfyUI Manager (search "Remove AI Watermarks") or manually:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/wiltodelta/ComfyUI-remove-ai-watermarks
+pip install -r ComfyUI-remove-ai-watermarks/requirements.txt
+```
+
+Nodes: Remove Visible Watermark, Detect Visible Watermark, Erase Region (by
+mask), and Remove Invisible Watermark / SynthID (needs the `gpu` extra).
+
 ## Usage
 
 ### CLI
@@ -232,9 +335,13 @@ remove-ai-watermarks batch ./images/ --mode all
 # of a clean origin. Add --json for machine-readable output.
 remove-ai-watermarks identify image.png
 
-# Visible watermark only — fast, offline, CPU. --mark auto (default) picks
-# between the Gemini sparkle and the Doubao "豆包AI生成" text strip; force one
-# with --mark gemini / --mark doubao.
+# Visible watermark only — fast, offline, CPU. --mark auto (default) finds the
+# strongest known mark (Gemini sparkle / Doubao "豆包AI生成" / Jimeng "即梦AI" /
+# Samsung Galaxy AI "Contenuti generati dall'AI"); force one with
+# --mark gemini / doubao / jimeng / samsung. Removed by reverse-alpha (true-pixel recovery).
+# If no known visible mark is found, it writes no output and exits 2 (not 0),
+# pointing you to `all` (for an invisible/metadata mark) or `erase` (for an
+# arbitrary logo) instead of handing back the unchanged image.
 remove-ai-watermarks visible image.png -o clean.png
 
 # Erase arbitrary region(s) — universal, any logo/watermark/object, any position.
@@ -242,9 +349,28 @@ remove-ai-watermarks visible image.png -o clean.png
 remove-ai-watermarks erase image.png --region 1640,1930,400,100 -o clean.png
 
 # Invisible watermark only (SynthID etc.) — requires GPU
-remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0
-# Runs at native resolution by default. On a very large image that OOMs the
-# GPU/MPS, cap the long side: --max-resolution 2048
+remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0 --unsharp 0.5
+# --humanize adds film grain, --unsharp counters the soft "AI" look (both opt-in).
+# Large images run at native resolution; small ones are upscaled to a 1024 floor
+# first (disable with --min-resolution 0); --upscaler esrgan uses Real-ESRGAN for
+# that floor upscale (needs the 'esrgan' extra). On a very large image that OOMs the
+# GPU/MPS, either cap the long side (--max-resolution 2048, lossy) or pass --tile
+# to regenerate in overlapping feather-blended tiles at native resolution (lossless).
+# Strength is vendor-adaptive by default (OpenAI 0.20 / Google 0.30, same
+# for both pipelines); override with --strength. controlnet (text/face
+# structure preservation) is the default pipeline; --pipeline sdxl opts down
+# to plain SDXL for non-structure inputs. Tune structure preservation with
+# --controlnet-scale, the CFG with --guidance-scale (default 7.5), and the
+# diffusion model with --model (default: SDXL base).
+# --adaptive-polish (ON by default) restores the input's detail level (sparing
+# text) to counter the over-smoothed look; it self-limits to a no-op where
+# there is no detail deficit. Disable with --no-adaptive-polish.
+# By default, if no invisible AI watermark is locally detectable, the diffusion
+# scrub is SKIPPED (regenerating pixels would only degrade a clean image): for
+# `invisible` that writes no output and exits 2, for `all` it skips step 2 but
+# still strips metadata and exits 0. A skip never claims the image is clean
+# (a pixel SynthID is undetectable once its metadata is gone). Pass --force to
+# regenerate regardless when you know the image is AI-generated.
 
 # Check / strip AI metadata (C2PA, EXIF, "Made with AI" labels)
 # --check also flags SynthID-bearing sources: a C2PA manifest signed by
@@ -256,6 +382,10 @@ remove-ai-watermarks metadata image.png --remove
 
 # Batch with a specific mode
 remove-ai-watermarks batch ./images/ --mode visible
+
+# Batch accepts the full invisible knob set (--strength/--guidance-scale/--model/
+# --pipeline/...); --adaptive-polish is on by default (--no-adaptive-polish to disable)
+remove-ai-watermarks batch ./images/ --mode all
 ```
 
 ### Python API
@@ -274,6 +404,30 @@ print(f"Detected: {result.detected} (confidence: {result.confidence:.1%})")
 # Remove
 clean = engine.remove_watermark(image)
 cv2.imwrite("clean.png", clean)
+```
+
+#### Invisible removal (diffusion)
+
+```python
+from pathlib import Path
+from remove_ai_watermarks.invisible_engine import InvisibleEngine
+
+# pipeline: "controlnet" (default, preserves text/face structure) or "sdxl" (plain).
+# model_id=None uses the SDXL base; controlnet_conditioning_scale tunes preservation.
+engine = InvisibleEngine(pipeline="controlnet")
+
+engine.remove_watermark(
+    Path("watermarked.png"),
+    Path("clean.png"),
+    strength=None,          # None = vendor-adaptive default (OpenAI 0.20 / Google 0.30)
+    num_inference_steps=50,
+    guidance_scale=None,    # None = the library default (7.5)
+    seed=None,              # set for reproducible output
+    adaptive_polish=True,   # detail-targeted polish, self-gating (default on in the CLI)
+    min_resolution=1024,    # upscale tiny inputs to this floor before diffusion
+    max_resolution=0,       # 0 = native; set only to cap GPU/MPS memory
+    upscaler="lanczos",     # or "esrgan" for the floor upscale (needs the 'esrgan' extra)
+)
 ```
 
 ### Metadata stripping
@@ -310,7 +464,7 @@ pip install certifi
 
 - [noai-watermark](https://github.com/mertizci/noai-watermark) by mertizci — invisible watermark removal engine
 - [GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool) by Allen Kuo (MIT) — visible watermark removal algorithm
-- [CtrlRegen](https://github.com/yepengliu/CtrlRegen) by Liu et al. (ICLR 2025) — controllable regeneration pipeline
+- [controlnet-canny-sdxl-1.0](https://huggingface.co/xinsir/controlnet-canny-sdxl-1.0) by xinsir — SDXL canny ControlNet used by the `controlnet` pipeline to preserve text/face structure
 - NeuralBleach (MIT) — analog humanizer technique
 
 ## Roadmap
@@ -318,16 +472,25 @@ pip install certifi
 Tracked but not yet implemented:
 
 - **SynthID-Image v2 automated regression test**. The default SDXL profile defeats v2 per manual checks against the [Gemini app](https://support.google.com/gemini/answer/16722517)'s "Verify with SynthID" feature on a Gemini 3 Pro output (May 2026). An automated end-to-end test would need either programmatic access to the [SynthID Detector portal](https://blog.google/innovation-and-ai/products/google-synthid-ai-content-detector/) (waitlist for media professionals and researchers) or an offline surrogate detector. The spectral phase-coherence surrogate from [reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) was evaluated and does not separate watermarked from cleaned real-content images (it only fires on controlled solid-color references at exact resolution), so it is not a usable oracle. Open.
-- **Local SynthID *pixel* detector**. Not feasible today: Google's decoder is proprietary, and magnitude/carrier spectral methods do not separate real content (confirmed by three independent evaluations, including a from-scratch gpt-image pilot; see CLAUDE.md). Blocked on either (a) a programmatic generation path (OpenAI / Gemini API) to build a per-(model, resolution) labeled corpus at scale, or (b) a raw watermarked-output dataset. If data arrives, the next approach to try is a learned classifier on diverse content rather than a fixed carrier codebook.
+- **Local SynthID *pixel* detector**. Not feasible today: Google's decoder is proprietary, and magnitude/carrier spectral methods do not separate real content (confirmed by three independent evaluations, including a from-scratch gpt-image pilot; see docs/known-limitations.md). Blocked on either (a) a programmatic generation path (OpenAI / Gemini API) to build a per-(model, resolution) labeled corpus at scale, or (b) a raw watermarked-output dataset. If data arrives, the next approach to try is a learned classifier on diverse content rather than a fixed carrier codebook.
 - **Grow the SynthID reference corpus** (`data/synthid_corpus/`) with oracle-labeled samples per model and resolution (Gemini app for Google, openai.com/verify for OpenAI). Prerequisite for any pixel-detector attempt and for an automated removal-regression set.
 - **Real non-PNG C2PA fixtures**. SynthID-source detection for JPEG / WebP / AVIF is currently covered only by synthetic byte blobs; replace with real vendor-emitted files to ground the binary-scan path.
-- **Maintenance debt**. Clear strict-pyright debt in `remove_ai_metadata` / `cli.py` (untyped piexif / PIL / click / rich) so `maintain.sh` can finish green. (`uv-secure` is already clean since `idna` was bumped to 3.16.)
-- **AVIF / HEIF / JPEG-XL detection limits**. Removal strips top-level C2PA `uuid` and JUMBF `jumb` boxes. EXIF/XMP boxes inside these containers are not yet scrubbed (PNG and JPEG are fully covered).
+- **Maintenance debt**. Strict pyright is now clean across `src/` (0 errors): pure-logic files are fully typed, the cv2 / torch / diffusers boundary files carry a documented per-file relax pragma, and a local `typings/piexif` stub covers piexif. Remaining: full-project `pyright` (no path) still OOMs node on this ML-heavy repo, so it must be scoped to `src/`; narrowing the boundary pragmas back toward full strict (as upstream stubs improve) is the long tail. (`uv-secure` is already clean since `idna` was bumped to 3.16.)
+- **AVIF / HEIF `Exif` item inside the `meta` box**. An AI-label *XMP* packet in a `meta`-box item is now blanked in place (v0.6.9), but EXIF stored as a `meta`-box `Exif` *item* is still not removed — it needs full `iinf`/`iloc` surgery (offset rewrite, corruption risk) or `exiftool` (a non-bundled binary dependency). Low priority: the AI labels we target are XMP, not EXIF, so an EXIF-only meta-box case is rare.
+- **More C2PA device signers**. Leica, Nikon, Google Pixel, Sony, and Truepic capture cameras are mapped (each verified against a real signed file); **Samsung Galaxy AI**, **Black Forest Labs (FLUX)**, and **ByteDance Volcano Engine** (Doubao / Jimeng) are now attributed too (verified on real signed files). Canon is still deferred until a real signed sample surfaces — no public direct-download C2PA file exists for it today (upload-to-verify / news-agency-licensed only).
+- **Resemble PerTh audio detection** — evaluated, not feasible with the public API: `get_watermark()` returns a raw bit array with no presence/confidence flag, so watermarked vs. clean audio can't be reliably separated without Resemble's fixed payload or a confidence service. Same wall as the SynthID pixel detector.
 - **Video pipeline (`noai-video`)**: per-frame inpainting and tracking for Sora 2 dynamic logo, Veo 3.1 badge, Kling, Runway. Separate package, not folded into this repo.
 
 Won't fix:
 
 - **Nightshade / Glaze / PhotoGuard removal**. These are defensive perturbations used by artists to protect their work from being scraped into AI training sets. Removing them attacks artists, not AI provenance. Out of scope.
+
+## Limitations
+
+- **Visible-mark and metadata removal is lossless.** Reverse-alpha recovers the original pixels under the mark; metadata stripping never touches image data.
+- **The invisible (SynthID) path is lossy and not guaranteed.** It runs a low-strength SDXL img2img regeneration, so it softens fine detail and is content-dependent. There is no public SynthID decoder, so the tool cannot verify removal locally; confirm with the Gemini app's "Verify with SynthID" oracle and raise `--strength` if it still detects. A vendor can change the scheme at any time, so treat this as an arms race, not a permanent fix.
+- **Large images: native by default, opt-in tiling for OOM.** The SynthID path runs at the diffusion model's native resolution; on a memory-constrained GPU/MPS you can either cap the long side with `--max-resolution` (lossy downscale) or pass `--tile` to regenerate in overlapping, feather-blended tiles at native resolution (lossless, no seam). Tiling is a memory workaround, not a quality upgrade over a single native pass: each tile is an independent low-strength regeneration. (Nano Banana 2 is natively 1024px; GPT Image 2 supports 4K experimentally.)
+- **Out of scope:** defeating trained AI-vs-real classifiers like Hive (see [Threat model](#threat-model)), visible-logo removal from video, and any guarantee that a stripped copy is untraceable server-side.
 
 ## Legal
 
@@ -336,24 +499,24 @@ Watermarking and provenance for AI-generated content is now regulated in several
 | Jurisdiction | Instrument | Status (May 2026) | Relevance |
 | --- | --- | --- | --- |
 | EU | AI Act, Article 50 | Transparency duties apply from **2 August 2026**. Legacy generative systems (placed on the market before that date) get a grandfathering period to **2 December 2026** for the Article 50(2) marking duty, under the Digital Omnibus (Commission proposal Nov 2025; co-legislator political agreement 7 May 2026). Article 50 guidelines and a marking Code of Practice are being finalised through 2026. | Removing mandated provenance markers with intent to deceive may be sanctioned under national implementations. |
-| US (federal) | COPIED Act | **Reintroduced April 2025; not enacted** (pending in the Senate). | If passed, would set NIST provenance standards and prohibit tampering with / removing provenance information. The tool itself is lawful; usage may not be. |
-| US (state) | CA AB 2655, TX SB 751, similar | TX SB 751 in force; **CA AB 2655 struck down** by a federal court (Aug 2025, Section 230 / First Amendment). | Content-specific (election deepfakes, sexual deepfakes). Not tool-specific. |
+| US (federal) | COPIED Act (S. 1396, 119th Cong.) | **Reintroduced April 2025; not enacted** (referred to Senate Commerce Committee). | If passed, would set NIST provenance standards and prohibit tampering with / removing provenance information. The tool itself is lawful; usage may not be. |
+| US (state) | CA AB 2655, TX SB 751 (2019), similar | TX SB 751 (2019) in force; **CA AB 2655 struck down** by a federal court (E.D. Cal., Aug 2025, *Kohls v. Bonta*) as preempted by **Section 230**; the court did not reach the First Amendment (the companion law AB 2839 was separately enjoined on First Amendment grounds). | Content-specific (election deepfakes, sexual deepfakes). Not tool-specific. |
 | US (state) | CA AB 853 (amends the California AI Transparency Act) | Core provider duties operative **2 August 2026** (delayed from 1 January 2026); large platforms 1 January 2027; capture devices 1 January 2028. | Covered providers (1M+ monthly users) must embed a latent disclosure that is "permanent or extraordinarily difficult to remove" and offer a free detection tool. Removing that disclosure is what this tool does. |
-| South Korea | AI Framework Act (Basic Act on AI), Article 31 | In force since **January 2026** (one-year transition after promulgation). | Art. 31(3): AI output "difficult to distinguish from reality" must be labeled so users "clearly recognize" it; the draft Enforcement Decree accepts a machine-readable (invisible-watermark) label. Artistic/creative works get a presentation exception. |
+| South Korea | AI Framework Act (Basic Act on AI), Article 31 | In force since **22 January 2026** (one-year transition after promulgation). | Art. 31(3): AI output "difficult to distinguish from reality" must be labeled so users "clearly recognize" it; the draft Enforcement Decree accepts a machine-readable (invisible-watermark) label. Artistic/creative works get a presentation exception. |
 | China | Measures for Labeling AI-Generated Content (+ GB 45438-2025) | In force since **1 September 2025**. | Mandatory explicit (visible) + implicit (metadata) labels across image / audio / video; tampering with, forging, or removing labels is prohibited. |
 | India | IT (Intermediary Guidelines and Digital Media Ethics Code) Amendment Rules, 2026 | In force since **20 February 2026** (notified 10 February 2026). | All "synthetically generated information" must be **prominently labelled** and carry **permanent metadata / a provenance identifier**; the rules expressly **prohibit modifying, suppressing, or removing** that label or metadata. Covers image, audio, and audio-visual content. |
 | UK | Online Safety Act 2023 / Ofcom guidance | In force, but **no statutory AI-provenance or watermarking obligation**. | Ofcom encourages watermarking / provenance metadata as voluntary "attribution measures"; platform duties, not user obligations. |
 
 ## Threat model
 
-This tool defends already-distributed AI imagery against automatic detection systems (social-platform "Made with AI" labels, third-party classifiers, content-policy filters). It does **not** retroactively anonymise generation.
+This tool removes specific, known signals: the embedded SynthID pixel watermark, the visible vendor marks, and the C2PA / EXIF / IPTC provenance metadata that platforms read to apply automatic "Made with AI" labels. It is **not** a general detector-evasion tool. It does **not** defeat trained statistical AI-vs-real classifiers (for example Hive Moderation), and a light diffusion pass will not reliably fool those, so a clean classifier hit after removal is expected, not a bug. It also does **not** retroactively anonymise generation. And watermarking is a weak trust signal in the first place: a marker that is almost always present yet trivially removable can make a cleaned forgery look more trustworthy, not less, which is why durable provenance more likely comes from signing genuine content than from watermarking synthetic content.
 
 In particular, **SynthID** (Google DeepMind) is embedded across Google's generative media stack — Imagen (images), Veo (video), Lyria (audio) — and Gemini app image outputs (Nano Banana / Gemini 3 Pro, which we verified positive via the Gemini app's SynthID oracle); Google reported over 10 billion items watermarked by December 2025. It carries a **multi-bit payload** — the research paper's SynthID-O variant encodes 136-bit payloads in 512x512 images ([arxiv 2510.09263](https://arxiv.org/abs/2510.09263)). The payload is believed to encode a user / session identifier. If the original watermarked file ever passed through a system controlled by the prompt originator (a saved Gemini account history, a screenshot uploaded to a Google product, a backup), Google retains the ability to link that original to the generating account. Stripping the watermark from a copy you possess does not erase Google's server-side record.
 
 Use cases where the threat model fits:
 - You generated the image yourself, want to publish it as your own work, and accept the consequences if Google ever publishes their detector logs.
 - You are running a security / robustness evaluation.
-- You are preserving art or historical record against false-positive "AI-generated" labels.
+- A real photo of yours was lightly AI-edited (a retouch in Gemini or ChatGPT, say) and now carries a SynthID or C2PA label that overstates how AI-generated it is, and you want to clear that label from your own copy.
 
 Use cases where the threat model **does not** fit:
 - Generating an image, expecting that removing the watermark anonymises you to Google. It doesn't.
@@ -375,4 +538,4 @@ Legitimate uses — publishing your own work, privacy (stripping metadata that l
 
 ## License
 
-MIT
+[Apache 2.0](LICENSE). Copyright 2025-2026 wiltodelta.

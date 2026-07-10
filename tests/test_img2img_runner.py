@@ -14,7 +14,10 @@ from unittest.mock import Mock
 import pytest
 
 from remove_ai_watermarks.noai import img2img_runner
-from remove_ai_watermarks.noai.img2img_runner import run_img2img, run_img2img_with_mps_fallback
+from remove_ai_watermarks.noai.img2img_runner import (
+    run_img2img,
+    run_img2img_with_mps_fallback,
+)
 
 _MPS_OOM = "MPS backend out of memory (MPS allocated: 17.21 GiB, max allowed: 20.13 GiB)"
 

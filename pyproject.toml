@@ -1,30 +1,91 @@
 [project]
 name = "remove-ai-watermarks"
-version = "0.6.4"
-description = "Remove visible and invisible AI watermarks from images (Gemini / Nano Banana, ChatGPT, Stable Diffusion)"
+version = "0.13.0"
+description = "AI watermark remover: strip visible and invisible AI watermarks (Gemini / Nano Banana sparkle, SynthID) and provenance metadata (C2PA, EXIF) from images"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
+keywords = [
+    "ai-watermark",
+    "ai-watermark-remover",
+    "watermark-remover",
+    "watermark-removal",
+    "remove-watermark",
+    "synthid",
+    "c2pa",
+    "content-credentials",
+    "nano-banana",
+    "gemini",
+    "gemini-watermark",
+    "ai-metadata",
+    "metadata-removal",
+    "provenance",
+    "exif",
+    "stable-diffusion",
+    "comfyui",
+    "ai-detection",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
 dependencies = [
     "pillow>=10.0.0",
     "piexif>=1.1.3",
     "numpy>=1.24.0",
     "opencv-python-headless>=4.8.0",
     "click>=8.0.0",
-    "rich>=13.0.0",
     "python-dotenv>=1.0.0",
+    # Official C2PA reader (Content Authenticity Initiative, MIT/Apache-2.0). The
+    # primary, spec-tracking manifest parser for the identify/metadata path; the
+    # hand-rolled caBX/CBOR scanner in noai/c2pa.py is kept only as a fallback for
+    # synthetic/partial blobs the validator rejects. Binary wheel (Rust), but the
+    # import is light (no torch/numpy) so it fits the dependency-light identify
+    # host. Prebuilt wheels cover the full CI matrix (linux/macos/windows).
+    "c2pa-python>=0.35.0",
 ]
 
 [project.optional-dependencies]
 gpu = [
     "torch>=2.0.0",
+    # The default PyPI torch wheel is a CPU/CUDA build. To drive an Intel GPU
+    # (Arc / Data Center) via ``--device xpu`` you need an XPU-enabled torch
+    # from PyTorch's XPU wheel index (Linux/Windows only -- there is no macOS
+    # XPU build). Install that build first, then this extra (torch is then
+    # already satisfied and won't be re-pulled):
+    #   pip install torch --index-url https://download.pytorch.org/whl/xpu
+    #   pip install 'remove-ai-watermarks[gpu]'
+    # uv users can target the ``pytorch-xpu`` index declared under [tool.uv]:
+    #   uv pip install torch --index-url https://download.pytorch.org/whl/xpu
     "diffusers>=0.38.0",
-    "transformers>=4.35.0",
+    # diffusers 0.38's auto-pipeline registry imports ``Qwen3VLForConditional
+    # Generation`` (its ``nucleusmoe_image`` pipeline), which only exists in
+    # transformers 5.x -- so ``from diffusers import AutoPipelineForImage2Image``
+    # fails on transformers 4.x. The real SDXL-loading break was NOT transformers
+    # 5.x but the tokenizers *release candidate* (0.23.0rc0) that the global
+    # ``prerelease = "allow"`` drags in: its CLIP tokenizer raises
+    # ``RobertaProcessing.__new__() got an unexpected keyword argument 'cls'``.
+    # Cap tokenizers to the stable 0.22 line (transformers 5.x accepts
+    # >=0.22,<=0.23.0) so the rc is excluded while SDXL still loads.
+    "transformers>=5,<6",
+    "tokenizers>=0.22,<0.23",
     "accelerate>=0.25.0",
-    "controlnet-aux>=0.0.9",
     "safetensors",
-    "ultralytics>=8.0.0",
-    "color-matcher>=0.5.0",
 ]
 # Open invisible-watermark (imwatermark) decoder for detecting the DWT-DCT
 # watermarks embedded by Stable Diffusion / SDXL / FLUX. Optional because it
@@ -51,21 +112,49 @@ lama = [
     "onnxruntime>=1.16.0",
     "huggingface-hub>=0.20.0",
 ]
+# Lightweight inpaint backend -- MI-GAN via onnxruntime (andraniksargsyan/migan,
+# MIT). CPU, no torch. Model (~28 MB) downloaded on first use and cached by
+# huggingface_hub; never bundled. ~700-950 MB peak RAM / ~0.19 s/call -- the
+# droplet-friendly tier (vs big-LaMa's ~4.7 GB) and the preferred inpaint backend
+# for the visible-mark fallback when installed. Same runtime as `lama`.
+migan = [
+    "onnxruntime>=1.16.0",
+    "huggingface-hub>=0.20.0",
+]
+# Optional pre-diffusion super-resolution for small inputs (Real-ESRGAN). Loaded via
+# spandrel (MIT) -- a pure model-loader with NO basicsr dependency (it pulls only
+# torch / torchvision / safetensors / numpy / einops).
+# The Real-ESRGAN weights (BSD-3-Clause) download on first use and are cached; they
+# are never bundled. CPU works but is slow on large inputs -- it is meant for the
+# pre-diffusion upscale of SMALL inputs (and the GPU worker). Guarded by
+# upscaler.is_available(); the default upscaler stays Lanczos (cv2, no deps). The
+# weights are fetched with torch.hub (bundled with spandrel's torch), so no extra
+# download dependency is needed.
+esrgan = [
+    "spandrel>=0.3.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     "pyright>=1.1.0",
     "invisible-watermark>=0.2.0",
+    # maintain.sh helpers; they only support newer Pythons, so gate them by
+    # marker to keep the py3.10 resolution (and CI matrix) solvable.
+    "uv-outdated>=0.1.0; python_version >= '3.12'",
+    "uv-secure>=0.12.0; python_version >= '3.12'",
 ]
-all = ["remove-ai-watermarks[gpu,detect,trustmark,lama,dev]"]
+all = ["remove-ai-watermarks[gpu,detect,trustmark,lama,migan,dev]"]
 
-# diffusers 0.38.0 (security fix for GHSA-98h9-4798-4q5v) declares a dependency
-# on safetensors>=0.8.0rc0 — a pre-release. Allow pre-releases globally so the
-# resolver can satisfy that. Drop once diffusers publishes a release with a
-# stable safetensors pin (or once safetensors 0.8.0 stable is out).
-[tool.uv]
-prerelease = "allow"
+# PyTorch Intel-GPU (XPU) wheel index. ``explicit = true`` keeps it inert for
+# the default CPU/CUDA install: uv consults it only when a torch install
+# explicitly targets it (see the ``gpu`` extra comment), so it does not alter
+# the locked CPU/CUDA resolution. Linux/Windows only -- no macOS XPU build.
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
 
 [project.scripts]
 remove-ai-watermarks = "remove_ai_watermarks.cli:main"
@@ -79,6 +168,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/remove_ai_watermarks"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the source distribution small: ship the package + metadata, not the
+# committed test corpora / calibration captures under data/ (tens of MB --
+# synthid_corpus images + the visible-mark captures), which pushed the 0.8.0
+# sdist past PyPI's per-project file-size limit (the wheel ships only src/).
+exclude = ["/data"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -98,10 +194,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["G004", "S108", "S310", "T20"]
 "tests/*.py" = ["ANN", "S101", "S105", "S106", "S108"]
 "src/remove_ai_watermarks/noai/watermark_remover.py" = ["S603", "S606", "S607", "T201"]  # subprocess calls for auto-install/CUDA fix
 "src/remove_ai_watermarks/noai/c2pa.py" = ["S110"]  # try-except-pass for corrupt file handling
-"src/remove_ai_watermarks/noai/ctrlregen/engine.py" = ["S101", "S603"]  # assert for loaded state, subprocess for auto-install
 
 [tool.ruff.format]
 quote-style = "double"

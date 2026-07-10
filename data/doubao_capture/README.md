@@ -1,5 +1,12 @@
 # Doubao visible watermark capture
 
+> **Status (captured 2026-05-29; alpha rebuilt 2026-05-31):** the black/gray/white captures were
+> taken and are now **committed** in `captures/` (solid colour + watermark, content-free). The alpha
+> map is rebuilt by `scripts/visible_alpha_solve.py doubao` (the careful gray-self solve shared with
+> Jimeng). The first build claimed "pixel-exact" but left a readable outline on the real sample (issue
+> #13 follow-up); removal now reverse-alphas, NCC-aligns, and applies a thin residual inpaint. See the
+> `doubao_engine.py` notes in the root `CLAUDE.md`. The text below is kept as the historical capture plan.
+
 Goal: capture the Doubao "豆包AI生成" visible watermark over known flat backgrounds so we can
 build a per-pixel alpha map and a reverse-alpha-blend remover, the same way the Gemini sparkle
 engine works (`src/remove_ai_watermarks/gemini_engine.py`).
@@ -16,8 +23,10 @@ engine works (`src/remove_ai_watermarks/gemini_engine.py`).
 - Size **scales with resolution**. Third-party numbers (~90x18 at <=1024, ~180x40 at >1024) are
   approximate and calibrated for ~1024-1280 outputs; at 2048 the strip is much larger. A shipped
   third-party alpha map is only 120x20, too small for our 2K/4K target -> capture fresh.
-- In practice clean inversion leaves residue on textured backgrounds, so the remover pairs the alpha
-  map with inpainting (our Gemini engine already does gradient-masked inpainting for residual edges).
+- The planning assumption was that clean inversion leaves residue on textured backgrounds, so the
+  remover would pair the alpha map with inpainting. After the capture this turned out unnecessary at
+  the native width (recovery is pixel-exact there and inpaint is off); the shipped remover is
+  reverse-alpha only, with a residual inpaint applied off-native only.
 
 ## Use doubao.com specifically
 
