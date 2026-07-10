@@ -1,5 +1,5 @@
 #define AppName "水印清除助手"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppPublisher "疯狂 AIGC 商业视觉"
 #define AppExeName "WatermarkHelper.exe"
 
