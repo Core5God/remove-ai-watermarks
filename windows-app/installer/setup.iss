@@ -19,9 +19,6 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#AppExeName}
 
-[Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-
 [Files]
 Source: "..\dist\WatermarkHelper\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
