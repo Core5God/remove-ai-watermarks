@@ -27,7 +27,7 @@ try {
       }
     } catch { }
   }
-  if (-not $homepageOk) { throw "打包后的 Windows 程序首页未能正常打开" }
+  if (-not $homepageOk) { throw "Frozen Windows app homepage did not become ready" }
   Write-Host "Frozen executable homepage smoke test passed"
 } finally {
   if ($smokeProcess -and -not $smokeProcess.HasExited) { Stop-Process -Id $smokeProcess.Id -Force }
@@ -39,5 +39,5 @@ $isccCandidates = @(
   "C:\ProgramData\chocolatey\lib\innosetup\tools\ISCC.exe"
 )
 $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not (Test-Path $iscc)) { throw "找不到 Inno Setup 编译器 ISCC.exe" }
+if (-not (Test-Path $iscc)) { throw "Inno Setup compiler ISCC.exe was not found" }
 & $iscc installer\setup.iss
