@@ -1,4 +1,5 @@
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import app  # noqa: E402
+import launcher  # noqa: E402
 
 
 class DesktopPackageTests(unittest.TestCase):
@@ -35,3 +37,20 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_xiaohongshu_profile_link_is_configurable(self):
         self.assertTrue(app.XIAOHONGSHU_URL.startswith("https://"))
+
+    def test_homepage_is_available(self):
+        response = app.app.test_client().get("/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_launcher_avoids_an_occupied_port(self):
+        choose_port = getattr(launcher, "choose_available_port", None)
+        self.assertIsNotNone(choose_port)
+        if choose_port is None:
+            return
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen(1)
+            occupied_port = occupied.getsockname()[1]
+            selected_port = choose_port(occupied_port)
+        self.assertNotEqual(selected_port, occupied_port)
+        self.assertGreater(selected_port, 0)
