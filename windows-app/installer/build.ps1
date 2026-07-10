@@ -10,6 +10,11 @@ py -3.11 -m venv .build-venv
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 & .\.build-venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name "水印清除助手" --add-data "static;static" --collect-all remove_ai_watermarks launcher.py
 
-$iscc = Get-ChildItem -Path "C:\Program Files (x86)","C:\Program Files" -Filter "ISCC.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+$isccCandidates = @(
+  "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+  "C:\Program Files\Inno Setup 6\ISCC.exe",
+  "C:\ProgramData\chocolatey\lib\innosetup\tools\ISCC.exe"
+)
+$iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not (Test-Path $iscc)) { throw "找不到 Inno Setup 编译器 ISCC.exe" }
 & $iscc installer\水印清除助手.iss
