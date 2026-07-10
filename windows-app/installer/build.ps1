@@ -6,6 +6,7 @@ Set-Location $root
 py -3.11 -m venv .build-venv
 & .\.build-venv\Scripts\python.exe -m pip install --upgrade pip
 & .\.build-venv\Scripts\python.exe -m pip install -r requirements.txt
+& .\.build-venv\Scripts\python.exe -m unittest discover -s tests -v
 
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 & .\.build-venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name "WatermarkHelper" --add-data "static;static" --collect-all remove_ai_watermarks launcher.py
