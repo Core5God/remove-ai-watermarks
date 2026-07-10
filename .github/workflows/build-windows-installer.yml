@@ -18,9 +18,10 @@ jobs:
         run: choco install innosetup --no-progress -y
       - name: Create installer
         shell: powershell
+        working-directory: windows-app
         run: .\installer\build.ps1
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: 水印清除助手-Windows-安装程序
-          path: release\*.exe
+          path: windows-app\release\*.exe
