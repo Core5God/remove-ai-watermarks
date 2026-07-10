@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import os
 import shutil
-import subprocess
 import sys
 import uuid
 import zipfile
@@ -42,8 +41,8 @@ def allowed(filename: str) -> bool:
 
 
 def build_command(mode: str, source: Path, output: Path, options: dict) -> list[str]:
-    """Call the packaged Python module, never a PATH-dependent CLI executable."""
-    command = [sys.executable, "-m", "remove_ai_watermarks.cli", mode, str(source), "-o", str(output)]
+    """Build CLI arguments without relaunching the frozen desktop executable."""
+    command = [mode, str(source), "-o", str(output)]
     if mode in {"all", "visible"}:
         if options.get("inpaint") is False:
             command.append("--no-inpaint")
@@ -57,20 +56,28 @@ def build_command(mode: str, source: Path, output: Path, options: dict) -> list[
             if value is not None and value != "auto":
                 command.extend([flag, str(value)])
     if mode == "metadata":
-        command = [sys.executable, "-m", "remove_ai_watermarks.cli", "metadata", "--remove", str(source), "-o", str(output)]
+        command = ["metadata", "--remove", str(source), "-o", str(output)]
         if options.get("remove_all"):
             command.append("--remove-all")
     return command
 
 
 def run_command(command: list[str], timeout: int = 600) -> tuple[int, str, str]:
+    """Run the bundled Click CLI in-process.
+
+    In a PyInstaller application ``sys.executable`` is this desktop program,
+    not a Python interpreter. Spawning it with ``-m`` relaunches the app and
+    opens another start page. CliRunner invokes the packaged command directly.
+    """
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return -1, "", "处理超时，请尝试较小的图片或降低处理强度。"
-    except FileNotFoundError:
-        return -1, "", "程序组件不完整，请重新安装。"
+        from click.testing import CliRunner
+        from remove_ai_watermarks.cli import main
+
+        result = CliRunner().invoke(main, command, catch_exceptions=True)
+        error = str(result.exception) if result.exception and result.exit_code != 0 else ""
+        return result.exit_code, result.output.strip(), error
+    except Exception as exc:
+        return -1, "", f"程序组件运行失败：{exc}"
 
 
 app = Flask(__name__, static_folder=str(resource_dir() / "static"))
