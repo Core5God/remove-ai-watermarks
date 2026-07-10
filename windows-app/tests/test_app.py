@@ -12,7 +12,7 @@ import app  # noqa: E402
 
 
 class DesktopPackageTests(unittest.TestCase):
-    def test_build_command_uses_the_bundled_cli_module(self):
+    def test_build_command_never_relaunches_the_frozen_desktop_executable(self):
         command = app.build_command(
             mode="visible",
             source=Path("input.png"),
@@ -20,7 +20,8 @@ class DesktopPackageTests(unittest.TestCase):
             options={"inpaint_method": "telea", "strip_metadata": False},
         )
 
-        self.assertEqual(command[:3], [sys.executable, "-m", "remove_ai_watermarks.cli"])
+        self.assertEqual(command[0], "visible")
+        self.assertNotIn(sys.executable, command)
         self.assertIn("--inpaint-method", command)
         self.assertIn("telea", command)
         self.assertIn("--keep-metadata", command)
