@@ -1,0 +1,13 @@
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
+
+# This runs on a Windows x64 machine or the GitHub Actions Windows runner.
+py -3.11 -m venv .build-venv
+& .\.build-venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.build-venv\Scripts\python.exe -m pip install -r requirements.txt
+
+Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
+& .\.build-venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name "WatermarkHelper" --add-data "static;static" --collect-all remove_ai_watermarks launcher.py
+
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\setup.iss
